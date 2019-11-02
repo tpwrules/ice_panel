@@ -161,7 +161,7 @@ class LineTimingGenerator(Elaboratable):
                 with m.If(self.i_idle == 0):
                     # the next line will start next cycle
                     m.d.sync += self.o_line_sync.eq(1)
-                    m.next = "IDLE"
+                    m.next = "OUTPUT"
 
         return m
 

@@ -61,8 +61,7 @@ class IceBlink(Elaboratable):
 
         # set some initial test defaults for the panel
         m.d.comb += [
-            b_rgb0.eq(1), b_rgb1.eq(2),
-            self.line_addr.eq(0),
+            b_rgb0.eq(1), b_rgb1.eq(1),
         ]
 
         # wire up the timing generator
@@ -72,8 +71,12 @@ class IceBlink(Elaboratable):
             b_shift_active.eq(ltg.o_shift_active),
             b_latch.eq(ltg.o_latch),
             b_blank.eq(ltg.o_blank),
-            b_line_addr.eq(Cat(0, 0, ltg.o_line_addr))
+            b_line_addr.eq(Cat(ltg.o_line_addr, 0))
         ]
+
+        # auto increment the line address so we scan the whole display
+        with m.If(ltg.o_line_sync):
+            m.d.sync += self.line_addr.eq(self.line_addr+1)
 
         return m
 
