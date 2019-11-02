@@ -49,7 +49,7 @@ class LineTimingGenerator(Elaboratable):
         # will be deasserted during idle.
         self.i_idle = Signal()
         # line addr input. automatically output to display at end of line
-        self.i_line_addr = Signal((panel_shape[1]//2).bit_length())
+        self.i_line_addr = Signal((panel_shape[1]//2-1).bit_length())
 
         # line sync output. asserted during the first pixel of the line.
         self.o_line_sync = Signal()
@@ -65,7 +65,7 @@ class LineTimingGenerator(Elaboratable):
 
 
         # current pixel output
-        self.pixel_ctr = UpCounter(panel_shape[0].bit_length(), reset=0)
+        self.pixel_ctr = UpCounter((panel_shape[0]-1).bit_length(), reset=0)
 
     def elaborate(self, platform):
         m = Module()
@@ -75,7 +75,7 @@ class LineTimingGenerator(Elaboratable):
         # by default:
         m.d.comb += [
             self.o_shift_active.eq(0), # not outputting pixels
-            pixel_ctr.reset.eq(0), # or counting them
+            pixel_ctr.reset.eq(1), # or counting them
             # display is active and we aren't latching
             self.o_blank.eq(0),
             self.o_latch.eq(0),
@@ -145,4 +145,3 @@ class LineTimingGenerator(Elaboratable):
                     m.next = "OUTPUT"
 
         return m
-

@@ -13,7 +13,7 @@ class IceBlink(Elaboratable):
 
         self.ltg = LineTimingGenerator(panel_shape)
 
-        self.line_addr = Signal((panel_shape[1]//2).bit_length())
+        self.line_addr = Signal((panel_shape[1]//2-1).bit_length())
 
     def elaborate(self, platform):
         platform.add_resources(pmod_resources.hub75_pmod)
@@ -21,7 +21,8 @@ class IceBlink(Elaboratable):
         m = Module()
         m.submodules.ltg = ltg = self.ltg
 
-        pmod = platform.request("hub75", 0)
+        # shift clock is DDR so we can cleanly gate it
+        pmod = platform.request("hub75", 0, xdr={"shift_clock": 2})
 
         # rename the signals from the display into nicer names
         p_rgb0 = Cat(pmod.r0, pmod.g0, pmod.b0)
@@ -40,7 +41,6 @@ class IceBlink(Elaboratable):
         b_latch = Signal.like(p_latch)
         b_blank = Signal.like(p_blank)
         b_shift_active = Signal()
-        p_shift_active = Signal()
 
         m.d.sync += [
             p_rgb0.eq(b_rgb0),
@@ -48,20 +48,29 @@ class IceBlink(Elaboratable):
             p_line_addr.eq(b_line_addr),
             p_latch.eq(b_latch),
             p_blank.eq(b_blank),
-            p_shift_active.eq(b_shift_active)
         ]
 
-        # and give the panel a clock. we invert it so there is time for the
-        # stuff on the wires to settle etc. and so that switching shift_active
-        # doesn't glitch.
-        plat_clk = ClockSignal()
+        # and give the panel a clock. we use DDR so we can cleanly gate it.
+        # instead of 1 -> 0 it goes shift_active -> 0, so that there's no high
+        # period if shift_active is deasserted. note that due to the latch in
+        # the pin, we don't use a delayed shift_active. note also that the clock
+        # is inverted so that the shift clock falls as the fpga clock rises so
+        # there's half a clock for the data to make it to the panel.
         m.d.comb += [
-            p_shift_clock.eq(p_shift_active & plat_clk)
+            p_shift_clock.o_clk.eq(ClockSignal()),
+            p_shift_clock.o0.eq(0),
+            p_shift_clock.o1.eq(b_shift_active),
+        ]
+
+        # for simulation, effective shift clock relative to b signals
+        b_shift_clk = Signal()
+        m.d.comb += [
+            b_shift_clk.eq(b_shift_active & ~ClockSignal())
         ]
 
         # set some initial test defaults for the panel
         m.d.comb += [
-            b_rgb0.eq(1), b_rgb1.eq(1),
+            b_rgb0.eq(ltg.pixel_ctr.value[0:3]), b_rgb1.eq(~ltg.pixel_ctr.value[0]),
         ]
 
         # wire up the timing generator
@@ -83,3 +92,9 @@ class IceBlink(Elaboratable):
 if __name__ == "__main__":
     design = IceBlink(panel_shape=(32, 16))
     ICEBreakerPlatform().build(design, do_program=True)
+
+# if __name__ == "__main__":
+#     from nmigen.cli import main
+#     design = IceBlink(panel_shape=(32, 16))
+#     main(design, platform=ICEBreakerPlatform(),
+#         ports=[v for k, v in design.__dict__.items() if k.startswith("p_") ])
