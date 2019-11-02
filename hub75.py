@@ -86,10 +86,6 @@ class LineTimingGenerator(Elaboratable):
             with m.State("OUTPUT"):
                 # we are actively shifting pixels into the display.
 
-                # deassert line sync. it gets asserted on transition into
-                # OUTPUT so we deassert it the first pixel so it's only on for
-                # one pixel.
-                m.d.sync += self.o_line_sync.eq(0)
                 # keep counting pixels out
                 m.d.comb += [
                     self.o_shift_active.eq(1),
@@ -100,11 +96,15 @@ class LineTimingGenerator(Elaboratable):
                 with m.If(pixel_ctr.at_max):
                     # yes, so the line is over
                     m.next = "BLANK"
+                    # and we want to emit the sync pulse
+                    m.d.sync += self.o_line_sync.eq(1)
 
             with m.State("BLANK"):
                 # we blank the display so there's no glitches as we apply
                 # the new pixels
                 m.d.comb += self.o_blank.eq(1)
+                # and finish the sync pulse
+                m.d.sync += self.o_line_sync.eq(0)
 
                 m.next = "ADDR"
 
@@ -134,14 +134,10 @@ class LineTimingGenerator(Elaboratable):
                 with m.If(self.i_idle == 1):
                     m.next = "IDLE" # idle if requested
                 with m.Else():
-                    # the next line will start next cycle
-                    m.d.sync += self.o_line_sync.eq(1)
                     m.next = "OUTPUT"
 
             with m.State("IDLE"):
                 with m.If(self.i_idle == 0):
-                    # the next line will start next cycle
-                    m.d.sync += self.o_line_sync.eq(1)
                     m.next = "OUTPUT"
 
         return m
