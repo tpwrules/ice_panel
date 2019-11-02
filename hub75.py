@@ -72,6 +72,15 @@ class LineTimingGenerator(Elaboratable):
         # register submodules (and make a local reference without self)
         m.submodules.pixel_ctr = pixel_ctr = self.pixel_ctr
 
+        # by default:
+        m.d.comb += [
+            self.o_shift_active.eq(0), # not outputting pixels
+            pixel_ctr.reset.eq(0), # or counting them
+            # display is active and we aren't latching
+            self.o_blank.eq(0),
+            self.o_latch.eq(0),
+        ]
+
         # state machine handles the parts of display generation
         with m.FSM("OUTPUT") as fsm:
             with m.State("OUTPUT"):
@@ -81,12 +90,8 @@ class LineTimingGenerator(Elaboratable):
                 # OUTPUT so we deassert it the first pixel so it's only on for
                 # one pixel.
                 m.d.sync += self.o_line_sync.eq(0)
-
+                # keep counting pixels out
                 m.d.comb += [
-                    # we aren't latching or blanking while we load the pixels in
-                    self.o_latch.eq(0),
-                    self.o_blank.eq(0),
-                    # but we do want to be shifting and counting out the pixels
                     self.o_shift_active.eq(1),
                     pixel_ctr.reset.eq(0),
                 ]
@@ -99,49 +104,32 @@ class LineTimingGenerator(Elaboratable):
             with m.State("BLANK"):
                 # we blank the display so there's no glitches as we apply
                 # the new pixels
-                m.d.comb += [
-                    self.o_latch.eq(0),
-                    self.o_blank.eq(1),
-                    # done clocking pixels out
-                    self.o_shift_active.eq(0),
-                    pixel_ctr.reset.eq(1),
-                ]
+                m.d.comb += self.o_blank.eq(1)
 
                 m.next = "ADDR"
 
             with m.State("ADDR"):
                 # address the row we want to apply the pixels to, while blanked
-                # to avoid smearing from the previous row.
+                # to avoid ghosting from the previously addressed row.
                 m.d.sync += self.o_line_addr.eq(self.i_line_addr)
-
-                m.d.comb += [
-                    self.o_latch.eq(0),
-                    self.o_blank.eq(1),
-                    self.o_shift_active.eq(0),
-                    pixel_ctr.reset.eq(1),
-                ]
+                m.d.comb += self.o_blank.eq(1)
 
                 m.next = "LATCH"
 
             with m.State("LATCH"):
-                # latch in the new data to the row selected above
+                # latch in the new data to the row selected above, remaining
+                # blank so we don't show the old row's data briefly
                 m.d.comb += [
                     self.o_latch.eq(1),
                     self.o_blank.eq(1),
-                    self.o_shift_active.eq(0),
-                    pixel_ctr.reset.eq(1),
                 ]
 
-                m.next = "UNLATCH"
+                m.next = "UNBLANK"
 
-            with m.State("UNLATCH"):
-                # unblank the display so everyone can see the shiny new line
-                m.d.comb += [
-                    self.o_latch.eq(0),
-                    self.o_blank.eq(0),
-                    self.o_shift_active.eq(0),
-                    pixel_ctr.reset.eq(1),
-                ]
+            with m.State("UNBLANK"):
+                # finally, unblank the display so everyone can see the
+                # shiny new line.
+                # (it's unblanked now because we didn't specifcally blank it)
 
                 with m.If(self.i_idle == 1):
                     m.next = "IDLE" # idle if requested
@@ -151,13 +139,6 @@ class LineTimingGenerator(Elaboratable):
                     m.next = "OUTPUT"
 
             with m.State("IDLE"):
-                m.d.comb += [
-                    self.o_latch.eq(0),
-                    self.o_blank.eq(0),
-                    self.o_shift_active.eq(0),
-                    pixel_ctr.reset.eq(1),
-                ]
-
                 with m.If(self.i_idle == 0):
                     # the next line will start next cycle
                     m.d.sync += self.o_line_sync.eq(1)
