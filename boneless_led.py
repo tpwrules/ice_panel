@@ -65,7 +65,7 @@ def firmware():
         MOVI(curr_fb_ptr, 0), # 0 is top left
         # we don't have a free register to keep track of where we are in the
         # message independently of where we are in the half message. we just
-        # modify the offset of the message characger load instruction to switch
+        # modify the offset of the message character load instruction to switch
         # halves.
         MOVR(temp1, "msg_ch_load_insn"),
         LD(temp2, temp1, 0),
@@ -149,11 +149,10 @@ def firmware():
         JNZ("display_msg_row"),
         JR(proc_ptr, 0),
     ]
-    # add the data as exti instructions since i don't immediately know
-    # how to do a .data or something in this mode
+    # adding data just consists of appending it to the instruction stream
     fw.append(L("message"))
     for m in "helloworld":
-        fw.append(EXTI(ord(m)-ord('d')))
+        fw.append(ord(m)-ord('d'))
 
     fw.append(L("fontdata"))
 
@@ -165,7 +164,7 @@ def firmware():
     # character range needed for "hello world".
     for ch in range(ord('d'), ord('w')+1):
         for row in range(8):
-            fw.append(EXTI(tft_font[ch*8+row]))
+            fw.append(tft_font[ch*8+row])
 
     return fw
 
