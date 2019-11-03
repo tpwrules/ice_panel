@@ -10,13 +10,13 @@ from boneless.arch.opcode import Instr
 from boneless.arch.opcode import *
 
 class BonelessLED(Elaboratable):
-    def __init__(self, panel_shape):
+    def __init__(self, panel_shape, led_domain="sync"):
         # panel shape: physical (width, height) in LEDs
         # i.e. width is how many pixels to shift out per row
         # and height is 2**(addr_bits)/2 (assuming two rows are driven at once)
         self.panel_shape = panel_shape
 
-        self.panel = BufferedHUB75(panel_shape)
+        self.panel = BufferedHUB75(panel_shape, led_domain=led_domain)
 
         self.cpu_rom = Memory(width=16, depth=256,
             init=Instr.assemble(firmware()))
@@ -164,34 +164,47 @@ def firmware():
 
 # super top domain to manage clock stuff
 class Top(Elaboratable):
-    def __init__(self, panel_shape):
+    def __init__(self, panel_shape, led_freq_mhz=12):
         self.panel_shape = panel_shape
-
-        self.boneless_led = BonelessLED(panel_shape)
+        self.led_freq_mhz = led_freq_mhz
 
     def elaborate(self, platform):
         # reserve the clock pin before it gets switched to the default domain
         clk_pin = platform.request(platform.default_clk, dir="-")
 
         m = Module()
-        # create the PLL to run the LED engine faster than the cpu and stuff
-        led_freq_mhz = 20
-        pll = PLL(12, led_freq_mhz, clk_pin,
-            orig_domain_name="cpu", # runs at 12MHz
-            pll_domain_name="led", # runs at the LED frequency
-        )
-        m.submodules.pll = pll
+        if self.led_freq_mhz != 12:
+            # create the PLL to run the LED engine faster than the cpu and stuff
+            pll = PLL(12, self.led_freq_mhz, clk_pin,
+                orig_domain_name="cpu", # runs at 12MHz
+                pll_domain_name="led", # runs at the LED frequency
+            )
+            m.submodules.pll = pll
+            led_domain = "led"
+        else:
+            # the user doesn't want to run faster and the PLL can't make
+            # input = output, so just create the CPU domain using the original
+            # clock and run the LEDs in that domain
+            cpu = ClockDomain("cpu")
+            m.domains += cpu
+            m.d.comb += ClockSignal("cpu").eq(clk_pin)
+            led_domain = "cpu"
 
-        # remap the default domain to the CPU domain, since most logic should
-        # run there.
-        boneless_led = DomainRenamer("cpu")(self.boneless_led)
+        # create the actual demo and tell it to run in the domain we made
+        # for it above
+        boneless_led = BonelessLED(self.panel_shape, led_domain=led_domain)
+
+        # remap the default sync domain to the CPU domain, since most logic
+        # should run there.
+        boneless_led = DomainRenamer("cpu")(boneless_led)
+
         m.submodules.boneless_led = boneless_led
 
         return m
 
 
 if __name__ == "__main__":
-    design = Top(panel_shape=(32, 16))
+    design = Top(panel_shape=(32, 16), led_freq_mhz=40)
     ICEBreakerPlatform().build(design, do_program=True)
 
 # if __name__ == "__main__":

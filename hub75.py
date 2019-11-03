@@ -280,8 +280,10 @@ class FrameTimingGenerator(Elaboratable):
 
 # buffer one channel for the whole panel in BRAM at 8bpp
 class PixelBuffer(Elaboratable):
-    def __init__(self, panel_shape):
+    def __init__(self, panel_shape, led_domain="sync"):
         self.panel_shape = panel_shape
+        # the memory read happens in the LED domain
+        self.led_domain = led_domain
 
         # calculate address widths
         self.row_bits = (panel_shape[1]//2-1).bit_length()
@@ -305,7 +307,8 @@ class PixelBuffer(Elaboratable):
     def elaborate(self, platform):
         m = Module()
         # register submodules (and make a local reference without self)
-        m.submodules.rdport = rdport = self.mem.read_port()
+        m.submodules.rdport = rdport = self.mem.read_port(
+            domain=self.led_domain, transparent=False)
         m.submodules.wrport = wrport = self.mem.write_port()
 
         # write port goes straight to the memory
@@ -327,8 +330,11 @@ class PixelBuffer(Elaboratable):
 
 # a whole screen and buffer
 class BufferedHUB75(Elaboratable):
-    def __init__(self, panel_shape):
+    def __init__(self, panel_shape, led_domain="sync"):
         self.panel_shape = panel_shape
+        # what domain to run the LED engine in. framebuffers will still be
+        # written to from sync.
+        self.led_domain = led_domain
         # calculate how wide the address components are
         self.row_bits = (self.panel_shape[1]//2-1).bit_length()
         self.col_bits = (self.panel_shape[0]-1).bit_length()
@@ -355,10 +361,13 @@ class BufferedHUB75(Elaboratable):
         self.pb_names = ("r0", "g0", "b0", "r1", "g1", "b1")
         self.pbs = {}
         for name in self.pb_names:
-            self.pbs[name] = PixelBuffer(panel_shape)
+            self.pbs[name] = PixelBuffer(panel_shape,
+                led_domain=self.led_domain)
 
         # and have a mechanism to actually generate the display
-        self.ftg = FrameTimingGenerator(panel_shape)
+        # (display generation happens in the LED clock domain)
+        self.ftg = \
+            DomainRenamer(self.led_domain)(FrameTimingGenerator(panel_shape))
 
     def elaborate(self, platform):
         # get the display from the platform.
@@ -377,7 +386,7 @@ class BufferedHUB75(Elaboratable):
         b_we = Signal.like(self.i_we)
         b_waddr = Signal.like(self.i_waddr)
         b_wdata = Signal.like(self.i_wdata)
-        m.d.sync += [
+        m.d.sync += [ # comes from memory write domain i.e. sync
             b_we.eq(self.i_we),
             b_waddr.eq(self.i_waddr),
             b_wdata.eq(self.i_wdata),
@@ -420,8 +429,9 @@ class BufferedHUB75(Elaboratable):
         m.d.comb += ftg.i_rgb1.eq(Cat(pbs[n+"1"].o_pixel for n in "rgb"))
 
         # we set the panel outputs synchronously so the panel doesn't see
-        # glitches as things settle
-        m.d.sync += [
+        # glitches as things settle. this is done in the LED domain.
+        d = getattr(m.d, self.led_domain)
+        d += [
             hub75.latch.eq(ftg.o_latch),
             hub75.blank.eq(ftg.o_blank),
 
@@ -442,7 +452,7 @@ class BufferedHUB75(Elaboratable):
         # falls as the FPGA clock rises. this gives half a clock for the data to
         # make it to the panel before being clocked in.
         m.d.comb += [
-            hub75.shift_clock.o_clk.eq(ClockSignal()),
+            hub75.shift_clock.o_clk.eq(ClockSignal(self.led_domain)),
             hub75.shift_clock.o0.eq(0),
             hub75.shift_clock.o1.eq(ftg.o_shift_active),
         ]
