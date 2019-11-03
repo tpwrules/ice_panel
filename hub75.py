@@ -264,3 +264,48 @@ class FrameTimingGenerator(Elaboratable):
                     m.next = "DOLINE"
 
         return m
+
+# buffer one channel for the whole panel in BRAM at 8bpp
+class PixelBuffer(Elaboratable):
+    def __init__(self, panel_shape):
+        self.panel_shape = panel_shape
+
+        # calculate address widths
+        self.row_bits = (panel_shape[1]//2-1).bit_length()
+        self.col_bits = (panel_shape[0]-1).bit_length()
+        self.pixel_bits = self.row_bits + self.col_bits
+
+        # write input port
+        self.i_we = Signal()
+        self.i_waddr = Signal(self.pixel_bits)
+        self.i_wdata = Signal(8)
+
+        # desired pixel from the frame generator
+        self.i_row = Signal(self.row_bits)
+        self.i_col = Signal(self.col_bits)
+
+        # what color that pixel is
+        self.o_pixel = Signal()
+
+        self.mem = Memory(width=8, depth=2**self.pixel_bits, init=[1, 1, 1])
+
+    def elaborate(self, platform):
+        m = Module()
+        # register submodules (and make a local reference without self)
+        m.submodules.rdport = rdport = self.mem.read_port()
+        m.submodules.wrport = wrport = self.mem.write_port()
+
+        # write port goes straight to the memory
+        m.d.comb += [
+            wrport.en.eq(self.i_we),
+            wrport.addr.eq(self.i_waddr),
+            wrport.data.eq(self.i_wdata),
+        ]
+
+        # read port goes to the frame generator
+        m.d.comb += [
+            rdport.addr.eq(Cat(self.i_col, self.i_row)),
+            self.o_pixel.eq(rdport.data[0]),
+        ]
+
+        return m
