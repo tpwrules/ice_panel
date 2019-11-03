@@ -2,6 +2,7 @@ from nmigen import *
 from nmigen_boards.icebreaker import *
 import pmod_resources
 from hub75 import BufferedHUB75
+from pll import PLL
 
 # boneless CPU architecture stuff
 from boneless.gateware import ALSRU_4LUT, CoreFSM
@@ -161,9 +162,36 @@ def firmware():
 
     return fw
 
+# super top domain to manage clock stuff
+class Top(Elaboratable):
+    def __init__(self, panel_shape):
+        self.panel_shape = panel_shape
+
+        self.boneless_led = BonelessLED(panel_shape)
+
+    def elaborate(self, platform):
+        # reserve the clock pin before it gets switched to the default domain
+        clk_pin = platform.request(platform.default_clk, dir="-")
+
+        m = Module()
+        # create the PLL to run the LED engine faster than the cpu and stuff
+        led_freq_mhz = 20
+        pll = PLL(12, led_freq_mhz, clk_pin,
+            orig_domain_name="cpu", # runs at 12MHz
+            pll_domain_name="led", # runs at the LED frequency
+        )
+        m.submodules.pll = pll
+
+        # remap the default domain to the CPU domain, since most logic should
+        # run there.
+        boneless_led = DomainRenamer("cpu")(self.boneless_led)
+        m.submodules.boneless_led = boneless_led
+
+        return m
+
 
 if __name__ == "__main__":
-    design = BonelessLED(panel_shape=(32, 16))
+    design = Top(panel_shape=(32, 16))
     ICEBreakerPlatform().build(design, do_program=True)
 
 # if __name__ == "__main__":
