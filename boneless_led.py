@@ -176,7 +176,9 @@ class BonelessLED(Elaboratable):
         return m
 
 def firmware():
-    period = 12000000//(4*3) # 10 pixels per second?
+    # time between color changes
+    # 1 second of clocks / (4 clocks per insn * 3 delay loop insns)
+    period = 12000000//(4*3)
     curr_color = R7
     curr_font_data = R6
     curr_msg_ptr = R5
@@ -188,24 +190,30 @@ def firmware():
     fw = [
         MOVI(curr_color, 1),
     L("display_msg"),
-        # point to top row
+        # draw first half of message on top half of screen
         MOVI(curr_msg_ptr, 0),
-        MOVI(curr_fb_ptr, 0),
-        # first 5 characters of message
-        MOVR(temp1, "lol_self_mod"),
+        MOVI(curr_fb_ptr, 0), # 0 is top left
+        # we don't have a free register to keep track of where we are in the
+        # message independently of where we are in the half message. we just
+        # modify the offset of the message characger load instruction to switch
+        # halves.
+        MOVR(temp1, "msg_ch_load_insn"),
         LD(temp2, temp1, 0),
-        ANDI(temp2, temp2, 0x1f ^ 0xFFFF),
+        ANDI(temp2, temp2, 0x1f ^ 0xFFFF), # clear offset to 0
         ST(temp2, temp1, 0),
+        # then go and display that half
         JAL(proc_ptr, "display_msg_row"),
-        # then bottom row
+
+        # now the bottom row
         MOVI(curr_msg_ptr, 0),
-        # second 5 characters of message
-        MOVR(temp1, "lol_self_mod"),
-        LD(temp2, temp1, 0),
-        ORI(temp2, temp2, 5),
-        ST(temp2, temp1, 0),
         MOVI(curr_fb_ptr, (32*8*4)),
+        # replace load offset with 5 to get second half of message
+        MOVR(temp1, "msg_ch_load_insn"),
+        LD(temp2, temp1, 0),
+        ORI(temp2, temp2, 5), # set offset to 5
+        ST(temp2, temp1, 0),
         JAL(proc_ptr, "display_msg_row"),
+
         # wait some time for the message to show
         MOVI(temp1, period&0xffff),
         MOVI(temp2, (period>>16)+1),
@@ -213,51 +221,61 @@ def firmware():
         SUBI(temp1, temp1, 1),
         SBBI(temp2, temp2, 0),
         JNZ ("delay"),
+
         # then switch colors and do it again
         ADDI(curr_color, curr_color, 1),
         J   ("display_msg"),
 
     L("display_msg_row"),
-        # load the current character
+        # we write to the display one row at a time to save index pointers.
+        # row 0 of character 0, row 0 of character 1, ..., row 1 of character 0,
+        # row 1 of character 1, ..., row 7 of character 4.
+
+        # in the framebuffer, for a 32x16 panel, there are 4 color words * 32
+        # columns * 16 rows. 
+
+        # load the current character of the message
         MOVR(temp1, "message"),
         ADD(temp1, temp1, curr_msg_ptr),
-    L("lol_self_mod"),
-        LD(temp1, temp1, 0), # 0 gets modified!!!
-        # then its font data
-        SLLI(temp1, temp1, 3), # make room for row
-        ANDI(temp2, curr_fb_ptr, 7<<7), # pull it out of the framebuffer pointer
+    L("msg_ch_load_insn"),
+        LD(temp1, temp1, 0), # offset gets modified!!!
+        # then the corresponding row of the font bitmap
+        SLLI(temp1, temp1, 3), # low 3 bits are row, remaining are character
+        ANDI(temp2, curr_fb_ptr, 7<<7), # pull row out of framebuffer pointer
         SRLI(temp2, temp2, 7),
         OR(temp1, temp1, temp2),
         MOVR(temp2, "fontdata"),
         ADD(temp1, temp1, temp2),
         LD(curr_font_data, temp1, 0),
+        # font is six pixels wide
         MOVI(ch_pixels_remaining, 6),
     L("display_ch_row"),
-        # assume this pixel is off
-        MOVI(temp2, 0),
-        ANDI(temp1, curr_font_data, 0x80), # is this pixel on?
-        JZ("display_ch_row_off"), # nah
+        MOVI(temp2, 0), # assume this pixel is off
+        ANDI(temp1, curr_font_data, 0x80), # but maybe it's on?
+        JZ("display_ch_row_pix_off"), # nah
         ANDI(temp2, curr_color, curr_color), # oh wait it is
-    L("display_ch_row_off"),
-        # pull out the colors and write them to this pixel location
-        STX(temp2, curr_fb_ptr, 0),
+    L("display_ch_row_pix_off"),
+        # pull out the colors and write them to the framebuffer
+        STX(temp2, curr_fb_ptr, 0), # bit 0 is red
         SRLI(temp2, temp2, 1),
-        STX(temp2, curr_fb_ptr, 1),
+        STX(temp2, curr_fb_ptr, 1), # bit 1 is green
         SRLI(temp2, temp2, 1),
-        STX(temp2, curr_fb_ptr, 2),
-        # now move to the next pixel
+        STX(temp2, curr_fb_ptr, 2), # bit 2 is blue
+        # then move to the next pixel
         ADDI(curr_fb_ptr, curr_fb_ptr, 4),
         SLLI(curr_font_data, curr_font_data, 1),
         # done with this character?
         SUBI(ch_pixels_remaining, ch_pixels_remaining, 1),
         JNZ("display_ch_row"),
-        ADDI(curr_msg_ptr, curr_msg_ptr, 1), # move to next message character
-        CMPI(curr_msg_ptr, 5), # done with this row?
+        # move to next character
+        ADDI(curr_msg_ptr, curr_msg_ptr, 1),
+        CMPI(curr_msg_ptr, 5), # done with this message half?
         JNZ("display_msg_row"),
-        # move to the next pixel row
-        ADDI(curr_fb_ptr, curr_fb_ptr, (32-(6*5))*4), # skip last two pixels
-        MOVI(curr_msg_ptr, 0),
-        ANDI(temp1, curr_fb_ptr, 7<<7), # done with the pixel rows?
+        # we only draw 6*5=30 out of 32 pixels, thus skip the last 2 so we start
+        # at the next row.
+        ADDI(curr_fb_ptr, curr_fb_ptr, (32-(6*5))*4),
+        MOVI(curr_msg_ptr, 0), # start from first character on next row
+        ANDI(temp1, curr_fb_ptr, 7<<7), # done with all the rows?
         JNZ("display_msg_row"),
         JR(proc_ptr, 0),
     ]
@@ -270,7 +288,12 @@ def firmware():
     fw.append(L("fontdata"))
 
     from font import tft_font
-    for ch in range(ord('d'), ord('w')+1): # W is the latest char we need
+    # the font bitmap is 6 pixels wide and 8 pixels high. bit 7 is the leftmost
+    # bit and bit 2 is the rightmost.
+
+    # we don't have enough free memory to hold a through z, so just store the
+    # character range needed for "hello world".
+    for ch in range(ord('d'), ord('w')+1):
         for row in range(8):
             fw.append(EXTI(tft_font[ch*8+row]))
 
