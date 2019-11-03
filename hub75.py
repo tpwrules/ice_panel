@@ -7,6 +7,7 @@
 # RGB0 and the other for RGB1. except for in the buffered addresses!
 
 from nmigen import *
+from nmigen.lib.coding import Decoder
 
 class UpCounter(Elaboratable):
     def __init__(self, width, init=0):
@@ -147,19 +148,25 @@ class LineTimingGenerator(Elaboratable):
 
 # keep track of where we are in the overall display
 class FrameTimingGenerator(Elaboratable):
-    def __init__(self, panel_shape):
+    def __init__(self, panel_shape, bpp=1):
         self.panel_shape = panel_shape
+        # bits per color per pixel. determines modulation steps
+        self.bpp = bpp
 
-        # the calculated pixel color
+        # the calculated pixel color. there's always just one bit per channel
+        # here; we tell the buffer what bit of the pixel we want now.
         self.i_rgb0 = Signal(3)
         self.i_rgb1 = Signal(3)
 
         self.row_bits = (panel_shape[1]//2-1).bit_length()
         self.col_bits = (panel_shape[0]-1).bit_length()
+        # index the bit of the pixel
+        self.bit_bits = (bpp-1).bit_length()
 
         # what pixel we are addressing
         self.o_row = Signal(self.row_bits)
         self.o_col = Signal(self.col_bits)
+        self.o_bit = Signal(self.bit_bits)
 
         # non-buffered color out, synchronous with line timing generator
         self.o_rgb0 = Signal(3)
@@ -191,6 +198,8 @@ class FrameTimingGenerator(Elaboratable):
 
         # thus every cycle there is a pixel being Addressed, a pixel being
         # Calculated, and a pixel being Displayed.
+
+        m.d.comb += self.o_bit.eq(0)
 
         # hold the currently displayed pixel
         disp_rgb0 = Signal(3)
@@ -278,31 +287,34 @@ class FrameTimingGenerator(Elaboratable):
 
         return m
 
-# buffer one channel for the whole panel in BRAM at 8bpp
+# buffer one channel for the whole panel in BRAM at an arbitrary bpp
 class PixelBuffer(Elaboratable):
-    def __init__(self, panel_shape, led_domain="sync"):
+    def __init__(self, panel_shape, led_domain="sync", bpp=1):
         self.panel_shape = panel_shape
+        self.bpp = bpp # number of bits per pixel
         # the memory read happens in the LED domain
         self.led_domain = led_domain
 
         # calculate address widths
         self.row_bits = (panel_shape[1]//2-1).bit_length()
         self.col_bits = (panel_shape[0]-1).bit_length()
+        self.bit_bits = (bpp-1).bit_length()
         self.pixel_bits = self.row_bits + self.col_bits
 
         # write input port from the CPU or whatever
         self.i_we = Signal()
         self.i_waddr = Signal(self.pixel_bits)
-        self.i_wdata = Signal(8)
+        self.i_wdata = Signal(self.bpp)
 
         # pixel the frame generator wants to read
         self.i_row = Signal(self.row_bits)
         self.i_col = Signal(self.col_bits)
+        self.i_bit = Signal(self.bit_bits)
 
         # what color that pixel is
         self.o_pixel = Signal()
 
-        self.mem = Memory(width=8, depth=2**self.pixel_bits)
+        self.mem = Memory(width=self.bpp, depth=2**self.pixel_bits)
 
     def elaborate(self, platform):
         m = Module()
@@ -319,19 +331,22 @@ class PixelBuffer(Elaboratable):
         ]
 
         # read port goes to the frame generator
+        bitmasker = Decoder(self.bpp)
+        m.submodules.bitmasker = bitmasker
         m.d.comb += [
+            bitmasker.i.eq(self.i_bit),
+
             rdport.addr.eq(Cat(self.i_col, self.i_row)),
-            # (for now we haven't got brightness working so just pretend
-            # this is 1bpp)
-            self.o_pixel.eq(rdport.data[0]),
+            self.o_pixel.eq((rdport.data & bitmasker.o) != 0),
         ]
 
         return m
 
 # a whole screen and buffer
 class BufferedHUB75(Elaboratable):
-    def __init__(self, panel_shape, led_domain="sync"):
+    def __init__(self, panel_shape, led_domain="sync", bpp=1):
         self.panel_shape = panel_shape
+        self.bpp = bpp # number of bits per color per pixel
         # what domain to run the LED engine in. framebuffers will still be
         # written to from sync.
         self.led_domain = led_domain
@@ -352,7 +367,7 @@ class BufferedHUB75(Elaboratable):
         # right, top to bottom
         self.i_we = Signal()
         self.i_waddr = Signal(self.addr_bits)
-        self.i_wdata = Signal(8)
+        self.i_wdata = Signal(self.bpp)
 
         # our only output is to the display, which we grab direct from the
         # platform during elaboration
@@ -362,12 +377,12 @@ class BufferedHUB75(Elaboratable):
         self.pbs = {}
         for name in self.pb_names:
             self.pbs[name] = PixelBuffer(panel_shape,
-                led_domain=self.led_domain)
+                led_domain=self.led_domain, bpp=self.bpp)
 
         # and have a mechanism to actually generate the display
         # (display generation happens in the LED clock domain)
-        self.ftg = \
-            DomainRenamer(self.led_domain)(FrameTimingGenerator(panel_shape))
+        self.ftg = DomainRenamer(self.led_domain)(
+            FrameTimingGenerator(panel_shape, bpp=self.bpp))
 
     def elaborate(self, platform):
         # get the display from the platform.
@@ -423,6 +438,7 @@ class BufferedHUB75(Elaboratable):
             m.d.comb += [
                 buffer.i_row.eq(ftg.o_row),
                 buffer.i_col.eq(ftg.o_col),
+                buffer.i_bit.eq(ftg.o_bit),
             ]
         # then wire the retrieved pixel back into the frame generator
         m.d.comb += ftg.i_rgb0.eq(Cat(pbs[n+"0"].o_pixel for n in "rgb"))

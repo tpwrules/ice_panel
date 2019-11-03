@@ -10,13 +10,20 @@ from boneless.arch.opcode import Instr
 from boneless.arch.opcode import *
 
 class BonelessLED(Elaboratable):
-    def __init__(self, panel_shape, led_domain="sync"):
+    def __init__(self, panel_shape, led_domain="sync", bpp=1):
         # panel shape: physical (width, height) in LEDs
         # i.e. width is how many pixels to shift out per row
         # and height is 2**(addr_bits)/2 (assuming two rows are driven at once)
         self.panel_shape = panel_shape
 
-        self.panel = BufferedHUB75(panel_shape, led_domain=led_domain)
+        self.bpp = bpp # number of bits per color per pixel
+        if bpp < 1:
+            raise Exception(
+                "who has a {}-color display?".format(2**bpp))
+        elif bpp > 16:
+            raise Exception("{}bpp? now that's just greedy".format(bpp))
+
+        self.panel = BufferedHUB75(panel_shape, led_domain=led_domain, bpp=bpp)
 
         self.cpu_rom = Memory(width=16, depth=256,
             init=Instr.assemble(firmware()))
@@ -33,7 +40,7 @@ class BonelessLED(Elaboratable):
         m.d.sync += [
             panel.i_we.eq(cpu_core.o_ext_we),
             panel.i_waddr.eq(cpu_core.o_bus_addr[:panel.addr_bits]),
-            panel.i_wdata.eq(cpu_core.o_ext_data[:8])
+            panel.i_wdata.eq(cpu_core.o_ext_data[:self.bpp])
         ]
 
         return m
@@ -164,9 +171,10 @@ def firmware():
 
 # super top domain to manage clock stuff
 class Top(Elaboratable):
-    def __init__(self, panel_shape, led_freq_mhz=12):
+    def __init__(self, panel_shape, led_freq_mhz=12, bpp=1):
         self.panel_shape = panel_shape
         self.led_freq_mhz = led_freq_mhz
+        self.bpp = bpp
 
     def elaborate(self, platform):
         # reserve the clock pin before it gets switched to the default domain
@@ -192,7 +200,8 @@ class Top(Elaboratable):
 
         # create the actual demo and tell it to run in the domain we made
         # for it above
-        boneless_led = BonelessLED(self.panel_shape, led_domain=led_domain)
+        boneless_led = BonelessLED(self.panel_shape,
+            led_domain=led_domain, bpp=self.bpp)
 
         # remap the default sync domain to the CPU domain, since most logic
         # should run there.
@@ -204,7 +213,7 @@ class Top(Elaboratable):
 
 
 if __name__ == "__main__":
-    design = Top(panel_shape=(32, 16), led_freq_mhz=40)
+    design = Top(panel_shape=(32, 16), led_freq_mhz=40, bpp=1)
     ICEBreakerPlatform().build(design, do_program=True)
 
 # if __name__ == "__main__":
