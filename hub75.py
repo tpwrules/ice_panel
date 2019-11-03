@@ -6,11 +6,11 @@
 from nmigen import *
 
 class UpCounter(Elaboratable):
-    def __init__(self, width, reset=0):
+    def __init__(self, width, init=0):
         # current value of the counter
-        self.value = Signal(width, reset=reset)
-        self._reset = reset
-        # reset counter. counter is set to reset at reset
+        self.value = Signal(width, reset=init)
+        self.init = init
+        # reset counter. counter is set to init at reset
         self.reset = Signal()
         # should we count? yes, by default
         self.enable = Signal(reset=1)
@@ -27,7 +27,7 @@ class UpCounter(Elaboratable):
         # are we being reset this cycle?
         with m.If(self.reset):
             # yes, load the reset value for next cycle
-            m.d.sync += self.value.eq(self._reset)
+            m.d.sync += self.value.eq(self.init)
         with m.Elif(self.enable):
             # no, load the next value for next cycle if we're allowed to count
             m.d.sync += self.value.eq(self.value+1)
@@ -48,12 +48,12 @@ class LineTimingGenerator(Elaboratable):
 
         # idle input. if asserted when the generator finishes a line,
         # the generator will not start on the next line until deasserted. blank
-        # will be deasserted during idle.
+        # is not asserted during idle.
         self.i_idle = Signal()
-        # line addr input. automatically output to display at end of line
+        # which line is being displayed. latched at the end of the line or so
         self.i_line_addr = Signal((panel_shape[1]//2-1).bit_length())
 
-        # line sync output. asserted during the first pixel of the line.
+        # line sync output. asserted during the last pixel of the line.
         self.o_line_sync = Signal()
         # shift active output. asserted when actively shifting pixels (and thus
         # the panel should receive the shift clock)
@@ -65,9 +65,8 @@ class LineTimingGenerator(Elaboratable):
         # line address bits, direct to panel
         self.o_line_addr = Signal.like(self.i_line_addr)
 
-
         # current pixel output
-        self.pixel_ctr = UpCounter((panel_shape[0]-1).bit_length(), reset=0)
+        self.pixel_ctr = UpCounter((panel_shape[0]-1).bit_length(), init=0)
 
     def elaborate(self, platform):
         m = Module()
@@ -83,7 +82,6 @@ class LineTimingGenerator(Elaboratable):
             self.o_latch.eq(0),
         ]
 
-        # state machine handles the parts of display generation
         with m.FSM("IDLE") as fsm:
             with m.State("OUTPUT"):
                 # we are actively shifting pixels into the display.
@@ -102,8 +100,8 @@ class LineTimingGenerator(Elaboratable):
                     m.d.sync += self.o_line_sync.eq(1)
 
             with m.State("BLANK"):
-                # we blank the display so there's no glitches as we apply
-                # the new pixels
+                # we blank the display so there's no glitches as we apply the
+                # new pixels
                 m.d.comb += self.o_blank.eq(1)
                 # and finish the sync pulse
                 m.d.sync += self.o_line_sync.eq(0)
@@ -149,22 +147,21 @@ class FrameTimingGenerator(Elaboratable):
     def __init__(self, panel_shape):
         self.panel_shape = panel_shape
 
-        # what color the next pixels should be. if location is output at cycle
-        # n, new color should be supplied at n+1
+        # the calculated pixel color
         self.i_rgb0 = Signal(3)
         self.i_rgb1 = Signal(3)
 
         self.row_bits = (panel_shape[1]//2-1).bit_length()
         self.col_bits = (panel_shape[0]-1).bit_length()
 
-        # what pixel we want
-        self.o_row = Signal(self.row_bits) # select 2 rows
+        # what pixel we are addressing
+        self.o_row = Signal(self.row_bits)
         self.o_col = Signal(self.col_bits)
 
         # non-buffered color out, synchronous with line timing generator
         self.o_rgb0 = Signal(3)
         self.o_rgb1 = Signal(3)
-        
+
         self.ltg = LineTimingGenerator(panel_shape)
         # and all the line generator outputs
         self.o_line_sync = self.ltg.o_line_sync
@@ -173,8 +170,8 @@ class FrameTimingGenerator(Elaboratable):
         self.o_blank = self.ltg.o_blank
         self.o_line_addr = self.ltg.o_line_addr
 
-        self.pixel_ctr = UpCounter(self.col_bits+self.row_bits, reset=0)
-        self.idle_ctr = UpCounter(14, reset=0)
+        self.pixel_ctr = UpCounter(self.col_bits+self.row_bits, init=0)
+        self.idle_ctr = UpCounter(14, init=0)
 
     def elaborate(self, platform):
         m = Module()
@@ -183,20 +180,20 @@ class FrameTimingGenerator(Elaboratable):
         m.submodules.pixel_ctr = pixel_ctr = self.pixel_ctr
         m.submodules.idle_ctr = idle_ctr = self.idle_ctr
 
-        # There are always three pixels in motion. The address of the most
+        # there are always three pixels in motion. the address of the most
         # recent pixel is output to o_row and o_col for whatever is calculating
-        # pixels. The next cycle, the pixel at i_rgbX is latched into disp_rgbX.
-        # The cycle after that, the pixel in disp_rgbX is output to the panel to
+        # pixels. the next cycle, the pixel at i_rgbX is latched into disp_rgbX.
+        # the cycle after that, the pixel in disp_rgbX is output to the panel to
         # be clocked in.
 
         # thus every cycle there is a pixel being Addressed, a pixel being
         # Calculated, and a pixel being Displayed.
 
-        # hold the calculated pixel for display
+        # hold the currently displayed pixel
         disp_rgb0 = Signal(3)
         disp_rgb1 = Signal(3)
 
-        # latch the calculated pixel into the display buffer
+        # latch the calculated pixel for display next cycle
         m.d.sync += [
             disp_rgb0.eq(self.i_rgb0),
             disp_rgb1.eq(self.i_rgb1),
@@ -207,13 +204,13 @@ class FrameTimingGenerator(Elaboratable):
             self.o_rgb1.eq(disp_rgb1),
         ]
 
-        # output pixel counter so pixel can be addressed
+        # address the pixel pointed to by the pixel counter
         m.d.comb += [
             self.o_col.eq(pixel_ctr.value[:self.col_bits]),
             self.o_row.eq(pixel_ctr.value[self.col_bits:]),
         ]
 
-        # simple names for state machine variables
+        # state machine variables
         should_idle = Signal() # should the line generator be idling?
         should_count = Signal() # should the pixel counter be counting?
         m.d.comb += [
@@ -231,30 +228,34 @@ class FrameTimingGenerator(Elaboratable):
             with m.State("STARTLINE"):
                 # starting to output a line.
 
-                # last cycle, a pixel was addressed with whatever was in
-                # pixel_ctr. increment the so we have a calculated pixel this
-                # cycle for DOLINE. counter so we ha
+                # this cycle, we are addressing the first pixel of the line (and
+                # have been since the end of the last line). increment the
+                # counter so we address the second on the next cycle, and have
+                # the first calculating when we transition into DOLINE.
                 m.d.comb += should_count.eq(1)
                 m.next = "DOLINE"
 
             with m.State("DOLINE"):
-                # we are now doing the line
+                # on the first cycle of DOLINE, we address the second pixel of
+                # the line and calculate the first. we stop idling the line
+                # generator at that point, meaning it will display the first
+                # pixel on the second cycle of DOLINE, exactly when the first
+                # pixel is finished calculating and is ready for display.
 
-                # de-idle the line generator. its first pixel will be next
-                # cycle.
+                # don't idle the line generator
                 m.d.comb += should_idle.eq(0)
                 # keep on counting the pixels throughout the line
                 m.d.comb += should_count.eq(1)
 
-                # is this the last pixel?
+                # are we addressing the last pixel?
                 with m.If(~pixel_ctr.value[:self.col_bits] == 0):
-                    # yes, tell the linereader the row for when it finishes
+                    # yes, tell the line generator what row it should update
+                    # whenever it finishes
                     m.d.sync += ltg.i_line_addr.eq(
                         pixel_ctr.value[self.col_bits:])
-                    # count one more pixel so the first pixel of the next line
-                    # is being addressed.
+                    # address the first pixel of the next line
                     m.d.comb += should_count.eq(1)
-                    # and wait for the line to end
+                    # and wait for this line to end
                     m.next = "ENDLINE"
 
             with m.State("ENDLINE"):
@@ -269,6 +270,7 @@ class FrameTimingGenerator(Elaboratable):
                 # just wait some time
                 m.d.comb += idle_ctr.reset.eq(0)
                 with m.If(idle_ctr.at_min):
+                    # once expired, go do the same thing for the next line
                     m.next = "STARTLINE"
 
         return m
@@ -283,12 +285,12 @@ class PixelBuffer(Elaboratable):
         self.col_bits = (panel_shape[0]-1).bit_length()
         self.pixel_bits = self.row_bits + self.col_bits
 
-        # write input port
+        # write input port from the CPU or whatever
         self.i_we = Signal()
         self.i_waddr = Signal(self.pixel_bits)
         self.i_wdata = Signal(8)
 
-        # desired pixel from the frame generator
+        # pixel the frame generator wants to read
         self.i_row = Signal(self.row_bits)
         self.i_col = Signal(self.col_bits)
 
@@ -313,6 +315,8 @@ class PixelBuffer(Elaboratable):
         # read port goes to the frame generator
         m.d.comb += [
             rdport.addr.eq(Cat(self.i_col, self.i_row)),
+            # (for now we haven't got brightness working so just pretend
+            # this is 1bpp)
             self.o_pixel.eq(rdport.data[0]),
         ]
 
