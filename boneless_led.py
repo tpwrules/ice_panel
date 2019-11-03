@@ -16,7 +16,11 @@ class BonelessLED(Elaboratable):
         self.panel_shape = panel_shape
 
         self.ftg = FrameTimingGenerator(panel_shape)
-        self.pbr0 = PixelBuffer(panel_shape)
+        # there's one buffer per panel pixel input, so 6 for 2xRGB
+        self.pixel_buffers = {}
+        self.pixel_buffer_names = ("r0", "g0", "b0", "r1", "g1", "b1")
+        for buffer in self.pixel_buffer_names:
+            self.pixel_buffers[buffer] = PixelBuffer(panel_shape)
 
         self.cpu_rom = Memory(width=16, depth=256,
             init=Instr.assemble(firmware()))
@@ -27,10 +31,12 @@ class BonelessLED(Elaboratable):
 
         m = Module()
         m.submodules.ftg = ftg = self.ftg
-        m.submodules.pbr0 = pbr0 = self.pbr0
         m.submodules.cpu_core = cpu_core = self.cpu_core
+        pixel_buffers = self.pixel_buffers
+        for buffer_name, buffer in pixel_buffers.items():
+            setattr(m.submodules, buffer_name, buffer)
 
-        # shift clock is DDR so we can cleanly gate it
+        # use DDR buffer on shift clock so we can cleanly gate it
         pmod = platform.request("hub75", 0, xdr={"shift_clock": 2})
 
         # rename the signals from the display into nicer names
@@ -43,7 +49,7 @@ class BonelessLED(Elaboratable):
         p_latch = pmod.latch
         p_blank = pmod.blank
 
-        # buffer panel outputs by one stage
+        # buffer panel outputs by one clock
         b_rgb0 = Signal.like(p_rgb0)
         b_rgb1 = Signal.like(p_rgb1)
         b_line_addr = Signal.like(p_line_addr)
@@ -79,13 +85,16 @@ class BonelessLED(Elaboratable):
 
         f_rgb0 = Signal(3)
         f_rgb1 = Signal(3)
+        f_allrgb = Cat(f_rgb0, f_rgb1)
 
         # attach the pixel buffers to the timing generator
-        m.d.comb += [
-            pbr0.i_row.eq(ftg.o_row),
-            pbr0.i_col.eq(ftg.o_col),
-            f_rgb0[0].eq(pbr0.o_pixel),
-        ]
+        for i, buffer_name in enumerate(self.pixel_buffer_names):
+            buffer = pixel_buffers[buffer_name]
+            m.d.comb += [
+                buffer.i_row.eq(ftg.o_row),
+                buffer.i_col.eq(ftg.o_col),
+                f_allrgb[i].eq(buffer.o_pixel),
+            ]
 
         # wire up the timing generator
         m.d.comb += [
@@ -99,37 +108,90 @@ class BonelessLED(Elaboratable):
             b_rgb1.eq(ftg.o_rgb1),
         ]
 
-        # hook up the CPU to the pixel buffer
-        with m.If(cpu_core.o_ext_we):
-            m.d.sync += [
-                pbr0.i_we.eq(1),
-                pbr0.i_waddr.eq(cpu_core.o_bus_addr[:pbr0.pixel_bits]),
-                pbr0.i_wdata.eq(cpu_core.o_ext_data[:8])
+        # decode the CPU's external memory bus
+        # 0x0000-0x7FFF is the framebuffer
+        # low 2 bits select R, G, B or nothing
+        # then all the bits to select a column
+        # then all the bits to select a row
+        # then a bit to select top or bottom half
+        # then repeating until the end of the memory
+
+        # add a delay of one clock so the CPU doesn't have to wait for us to
+        # decode
+        cpu_ext_we = Signal.like(cpu_core.o_ext_we)
+        cpu_ext_waddr = Signal.like(cpu_core.o_bus_addr)
+        cpu_ext_wdata = Signal.like(cpu_core.o_ext_data)
+        m.d.sync += [
+            cpu_ext_we.eq(cpu_core.o_ext_we),
+            cpu_ext_waddr.eq(cpu_core.o_bus_addr),
+            cpu_ext_wdata.eq(cpu_core.o_ext_data),
+        ]
+
+        row_bits = (self.panel_shape[1]//2-1).bit_length()
+        col_bits = (self.panel_shape[0]-1).bit_length()
+        pixel_bits = row_bits + col_bits + 1
+
+        # split apart CPU memory bus as above
+        is_fb = Signal()
+        fb_color = Signal(2)
+        fb_row = Signal(row_bits)
+        fb_col = Signal(col_bits)
+        fb_half = Signal()
+        m.d.comb += [
+            is_fb.eq(~cpu_ext_waddr[-1]),
+            fb_color.eq(cpu_ext_waddr[:2]),
+            fb_col.eq(cpu_ext_waddr[2:2+col_bits]),
+            fb_row.eq(cpu_ext_waddr[2+col_bits:2+col_bits+row_bits]),
+            fb_half.eq(cpu_ext_waddr[2+col_bits+row_bits]),
+        ]
+
+        # then recombine into the pixel buffer addresses
+        pb_waddr = Signal(pixel_bits)
+        pb_wdata = Signal(8)
+        m.d.comb += [
+            pb_waddr.eq(Cat(fb_col, fb_row)),
+            pb_wdata.eq(cpu_ext_wdata[:8]),
+        ]
+        # now route the addresses to all the pixel buffers, and determine which
+        # should be enabled when
+        for name, buffer in self.pixel_buffers.items():
+            color_en = Signal() # correct pixel?
+            half_en = Signal() # correct display half?
+            m.d.comb += [
+                color_en.eq(fb_color == "rgb".index(name[0])),
+                half_en.eq(fb_half == "01".index(name[1])),
+
+                buffer.i_we.eq(color_en & half_en & cpu_ext_we),
+                buffer.i_waddr.eq(pb_waddr),
+                buffer.i_wdata.eq(pb_wdata),
             ]
 
+        # hook up the CPU's external bus to our decoder
+        m.d.sync += [
+            cpu_ext_we.eq(cpu_core.o_ext_we),
+            cpu_ext_waddr.eq(cpu_core.o_bus_addr),
+            cpu_ext_wdata.eq(cpu_core.o_ext_data)
+        ]
 
         return m
 
 def firmware():
-    period = 6000000//(4*3) # 4 CPI, 3 instructions
+    period = 600000//(4*3) # 10 pixels per second?
     return [
-        MOVI(R7, 0xa),
-    L("blink"),
-        XORI(R7, R7, 0xf),
-        STXA(R7, 0),
-        SRLI(R6, R7, 1),
-        STXA(R6, 1),
-        SRLI(R6, R6, 1),
-        STXA(R6, 2),
-        SRLI(R6, R6, 1),
-        STXA(R6, 3),
+        MOVI(R7, 0),
+        MOVI(R6, 1),
+    L("poke"),
+        STX(R6, R7, 0),
+        STX(R6, R7, 1),
+        STX(R6, R7, 2),
+        ADDI(R7, R7, 4),
         MOVI(R1, period&0xffff),
-        MOVI(R2, period>>16),
+        MOVI(R2, (period>>16)+1),
     L("loop"),
         SUBI(R1, R1, 1),
         SBBI(R2, R2, 0),
         JNZ ("loop"),
-        J   ("blink"),
+        J   ("poke"),
     ]
 
 

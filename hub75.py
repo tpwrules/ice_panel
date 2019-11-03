@@ -295,14 +295,7 @@ class PixelBuffer(Elaboratable):
         # what color that pixel is
         self.o_pixel = Signal()
 
-        init = []
-        for a in range(8):
-            init.append(1)
-            for b in range(32):
-                init.append(0)
-        init = init[:2**self.pixel_bits]
-
-        self.mem = Memory(width=8, depth=2**self.pixel_bits, init=init)
+        self.mem = Memory(width=8, depth=2**self.pixel_bits)
 
     def elaborate(self, platform):
         m = Module()
