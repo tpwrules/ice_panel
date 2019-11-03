@@ -1,7 +1,10 @@
 # modules related to driving a HUB75 connector display.
 # we refer a lot to panel_shape: physical (width, height) in LEDs
 # i.e. width is how many pixels to shift out per row
-# and height is 2**(addr_bits)/2 (assuming two rows are driven at once)
+# and height is 2**(addr_bits)/2 (because two rows are driven at once)
+#
+# we basically always assume one pixel/address/etc is actually two, one for
+# RGB0 and the other for RGB1. except for in the buffered addresses!
 
 from nmigen import *
 
@@ -318,6 +321,130 @@ class PixelBuffer(Elaboratable):
             # (for now we haven't got brightness working so just pretend
             # this is 1bpp)
             self.o_pixel.eq(rdport.data[0]),
+        ]
+
+        return m
+
+# a whole screen and buffer
+class BufferedHUB75(Elaboratable):
+    def __init__(self, panel_shape):
+        self.panel_shape = panel_shape
+        # calculate how wide the address components are
+        self.row_bits = (self.panel_shape[1]//2-1).bit_length()
+        self.col_bits = (self.panel_shape[0]-1).bit_length()
+        self.pixel_bits = self.row_bits + self.col_bits
+        # + 1 because each address above refers to two indepdendent pixels,
+        # + 2 to select pixel color channel
+        self.addr_bits = self.pixel_bits + 1 + 2
+
+        # framebuffer write inputs.
+        # the low 2 bits of the address select R, G, B, or nothing.
+        # next N bits select 2**N columns (X position).
+        # next M bits select 2**M rows (Y position).
+        # the last bit selects screen half (RGB0 or RGB1).
+        # this means the display is linearly addressed R, G, B color, left to
+        # right, top to bottom
+        self.i_we = Signal()
+        self.i_waddr = Signal(self.addr_bits)
+        self.i_wdata = Signal(8)
+
+        # our only output is to the display, which we grab direct from the
+        # platform during elaboration
+
+        # buffer each channel of the display independently
+        self.pb_names = ("r0", "g0", "b0", "r1", "g1", "b1")
+        self.pbs = {}
+        for name in self.pb_names:
+            self.pbs[name] = PixelBuffer(panel_shape)
+
+        # and have a mechanism to actually generate the display
+        self.ftg = FrameTimingGenerator(panel_shape)
+
+    def elaborate(self, platform):
+        # get the display from the platform.
+        # we use DDR buffer on shift clock so we can cleanly gate it.
+        hub75 = platform.request("hub75", 0, xdr={"shift_clock": 2})
+        
+        m = Module()
+        m.submodules.ftg = ftg = self.ftg
+        pbs = self.pbs
+        for name, buffer in pbs.items():
+            # register all the buffers we made
+            setattr(m.submodules, name, buffer)
+
+        # handle the write data input
+        # buffer them so we can decode at our leisure
+        b_we = Signal.like(self.i_we)
+        b_waddr = Signal.like(self.i_waddr)
+        b_wdata = Signal.like(self.i_wdata)
+        m.d.sync += [
+            b_we.eq(self.i_we),
+            b_waddr.eq(self.i_waddr),
+            b_wdata.eq(self.i_wdata),
+        ]
+
+        # split the write address into the various pixel addresses
+        addr_color = Signal(2)
+        addr_row = Signal(self.row_bits)
+        addr_col = Signal(self.col_bits)
+        addr_half = Signal()
+        row_bits, col_bits = self.row_bits, self.col_bits
+        m.d.comb += [
+            addr_color.eq(b_waddr[:2]),
+            addr_col.eq(b_waddr[2:2+col_bits]),
+            addr_row.eq(b_waddr[2+col_bits:2+col_bits+row_bits]),
+            addr_half.eq(b_waddr[2+col_bits+row_bits]),
+        ]
+
+        # then wire up those addresses to the pixel buffers
+        for name, buffer in pbs.items():
+            color_en = Signal() # addressed color matches this buffer?
+            half_en = Signal() # addressed display half matches this buffer?
+            m.d.comb += [
+                color_en.eq(addr_color == "rgb".index(name[0])),
+                half_en.eq(addr_half == "01".index(name[1])),
+
+                buffer.i_we.eq(color_en & half_en & b_we),
+                buffer.i_waddr.eq(Cat(addr_col, addr_row)),
+                buffer.i_wdata.eq(b_wdata),
+            ]
+
+        # tell the buffers what pixel the frame generator wants
+        for name, buffer in pbs.items():
+            m.d.comb += [
+                buffer.i_row.eq(ftg.o_row),
+                buffer.i_col.eq(ftg.o_col),
+            ]
+        # then wire the retrieved pixel back into the frame generator
+        m.d.comb += ftg.i_rgb0.eq(Cat(pbs[n+"0"].o_pixel for n in "rgb"))
+        m.d.comb += ftg.i_rgb1.eq(Cat(pbs[n+"1"].o_pixel for n in "rgb"))
+
+        # we set the panel outputs synchronously so the panel doesn't see
+        # glitches as things settle
+        m.d.sync += [
+            hub75.latch.eq(ftg.o_latch),
+            hub75.blank.eq(ftg.o_blank),
+
+            Cat(hub75.r0, hub75.g0, hub75.b0).eq(ftg.o_rgb0),
+            Cat(hub75.r1, hub75.g1, hub75.b1).eq(ftg.o_rgb1),
+
+            Cat(getattr(hub75, "a"+str(n)) for n in range(5)).eq(
+                Cat(ftg.o_line_addr, 0))
+        ]
+
+        # now we have to generate the panel shift clock.
+        # we use DDR so we can cleanly gate it. instead of the panel receiving
+        # 1->0, it receives 0->shift active, so that there's no high period if
+        # shift_active is deasserted.
+        # note that we don't use a buffered version of shift_active because the
+        # DDR logic already has a buffer.
+        # note also that we output an inverted signal so that the shift clock
+        # falls as the FPGA clock rises. this gives half a clock for the data to
+        # make it to the panel before being clocked in.
+        m.d.comb += [
+            hub75.shift_clock.o_clk.eq(ClockSignal()),
+            hub75.shift_clock.o0.eq(0),
+            hub75.shift_clock.o1.eq(ftg.o_shift_active),
         ]
 
         return m
