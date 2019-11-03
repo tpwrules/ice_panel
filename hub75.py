@@ -12,6 +12,8 @@ class UpCounter(Elaboratable):
         self._reset = reset
         # reset counter. counter is set to reset at reset
         self.reset = Signal()
+        # should we count? yes, by default
+        self.enable = Signal(reset=1)
 
         # is the counter at its maximum value?
         self.at_max = Signal()
@@ -26,8 +28,8 @@ class UpCounter(Elaboratable):
         with m.If(self.reset):
             # yes, load the reset value for next cycle
             m.d.sync += self.value.eq(self._reset)
-        with m.Else():
-            # no, load the next value for next cycle
+        with m.Elif(self.enable):
+            # no, load the next value for next cycle if we're allowed to count
             m.d.sync += self.value.eq(self.value+1)
 
         # check counter position this cycle
@@ -82,7 +84,7 @@ class LineTimingGenerator(Elaboratable):
         ]
 
         # state machine handles the parts of display generation
-        with m.FSM("OUTPUT") as fsm:
+        with m.FSM("IDLE") as fsm:
             with m.State("OUTPUT"):
                 # we are actively shifting pixels into the display.
 
@@ -139,5 +141,126 @@ class LineTimingGenerator(Elaboratable):
             with m.State("IDLE"):
                 with m.If(self.i_idle == 0):
                     m.next = "OUTPUT"
+
+        return m
+
+# keep track of where we are in the overall display
+class FrameTimingGenerator(Elaboratable):
+    def __init__(self, panel_shape):
+        self.panel_shape = panel_shape
+
+        # what color the next pixels should be. if location is output at cycle
+        # n, new color should be supplied at n+1
+        self.i_rgb0 = Signal(3)
+        self.i_rgb1 = Signal(3)
+
+        self.row_bits = (panel_shape[1]//2-1).bit_length()
+        self.col_bits = (panel_shape[0]-1).bit_length()
+
+        # what pixel we want
+        self.o_row = Signal(self.row_bits) # select 2 rows
+        self.o_col = Signal(self.col_bits)
+
+        # non-buffered color out, synchronous with line timing generator
+        self.o_rgb0 = Signal(3)
+        self.o_rgb1 = Signal(3)
+        
+        self.ltg = LineTimingGenerator(panel_shape)
+        # and all the line generator outputs
+        self.o_line_sync = self.ltg.o_line_sync
+        self.o_shift_active = self.ltg.o_shift_active
+        self.o_latch = self.ltg.o_latch
+        self.o_blank = self.ltg.o_blank
+        self.o_line_addr = self.ltg.o_line_addr
+
+        self.pixel_ctr = UpCounter(self.col_bits+self.row_bits, reset=0)
+
+    def elaborate(self, platform):
+        m = Module()
+        # register submodules (and make a local reference without self)
+        m.submodules.ltg = ltg = self.ltg
+        m.submodules.pixel_ctr = pixel_ctr = self.pixel_ctr
+
+        # There are always three pixels in motion. The address of the most
+        # recent pixel is output to o_row and o_col for whatever is calculating
+        # pixels. The next cycle, the pixel at i_rgbX is latched into disp_rgbX.
+        # The cycle after that, the pixel in disp_rgbX is output to the panel to
+        # be clocked in.
+
+        # thus every cycle there is a pixel being Addressed, a pixel being
+        # Calculated, and a pixel being Displayed.
+
+        # hold the calculated pixel for display
+        disp_rgb0 = Signal(3)
+        disp_rgb1 = Signal(3)
+
+        # latch the calculated pixel into the display buffer
+        m.d.sync += [
+            disp_rgb0.eq(self.i_rgb0),
+            disp_rgb1.eq(self.i_rgb1),
+        ]
+        # display the pixel in the display buffer
+        m.d.comb += [
+            self.o_rgb0.eq(disp_rgb0),
+            self.o_rgb1.eq(disp_rgb1),
+        ]
+
+        # output pixel counter so pixel can be addressed
+        m.d.comb += [
+            self.o_col.eq(pixel_ctr.value[:self.col_bits]),
+            self.o_row.eq(pixel_ctr.value[self.col_bits:]),
+        ]
+
+        # simple names for state machine variables
+        should_idle = Signal() # should the line generator be idling?
+        should_count = Signal() # should the pixel counter be counting?
+        m.d.comb += [
+            ltg.i_idle.eq(should_idle),
+            pixel_ctr.enable.eq(should_count),
+        ]
+        # by default:
+        m.d.comb += [
+            should_idle.eq(1),
+            should_count.eq(0),
+        ]
+
+        with m.FSM("STARTLINE") as fsm:
+            with m.State("STARTLINE"):
+                # starting to output a line.
+
+                # last cycle, a pixel was addressed with whatever was in
+                # pixel_ctr. increment the so we have a calculated pixel this
+                # cycle for DOLINE. counter so we ha
+                m.d.comb += should_count.eq(1)
+                m.next = "DOLINE"
+
+            with m.State("DOLINE"):
+                # we are now doing the line
+
+                # de-idle the line generator. its first pixel will be next
+                # cycle.
+                m.d.comb += should_idle.eq(0)
+                # keep on counting the pixels throughout the line
+                m.d.comb += should_count.eq(1)
+
+                # is this the last pixel?
+                with m.If(~pixel_ctr.value[:self.col_bits] == 0):
+                    # yes, tell the linereader the row for when it finishes
+                    m.d.sync += ltg.i_line_addr.eq(
+                        pixel_ctr.value[self.col_bits:])
+                    # count one more pixel so the first pixel of the next line
+                    # is being addressed.
+                    m.d.comb += should_count.eq(1)
+                    # and wait for the line to end
+                    m.next = "ENDLINE"
+
+            with m.State("ENDLINE"):
+                # wait for the line to be latched so we know it's finished
+                with m.If(self.ltg.o_latch):
+                    # we addressed the first pixel of this line at the end of
+                    # last. count out another so we have two pixels going into
+                    # DOLINE.
+                    m.d.comb += should_count.eq(1)
+                    m.next = "DOLINE"
 
         return m
