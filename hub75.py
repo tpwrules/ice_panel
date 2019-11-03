@@ -174,12 +174,14 @@ class FrameTimingGenerator(Elaboratable):
         self.o_line_addr = self.ltg.o_line_addr
 
         self.pixel_ctr = UpCounter(self.col_bits+self.row_bits, reset=0)
+        self.idle_ctr = UpCounter(14, reset=0)
 
     def elaborate(self, platform):
         m = Module()
         # register submodules (and make a local reference without self)
         m.submodules.ltg = ltg = self.ltg
         m.submodules.pixel_ctr = pixel_ctr = self.pixel_ctr
+        m.submodules.idle_ctr = idle_ctr = self.idle_ctr
 
         # There are always three pixels in motion. The address of the most
         # recent pixel is output to o_row and o_col for whatever is calculating
@@ -222,6 +224,7 @@ class FrameTimingGenerator(Elaboratable):
         m.d.comb += [
             should_idle.eq(1),
             should_count.eq(0),
+            idle_ctr.reset.eq(1),
         ]
 
         with m.FSM("STARTLINE") as fsm:
@@ -257,11 +260,16 @@ class FrameTimingGenerator(Elaboratable):
             with m.State("ENDLINE"):
                 # wait for the line to be latched so we know it's finished
                 with m.If(self.ltg.o_latch):
-                    # we addressed the first pixel of this line at the end of
-                    # last. count out another so we have two pixels going into
-                    # DOLINE.
-                    m.d.comb += should_count.eq(1)
-                    m.next = "DOLINE"
+                    # we want to wait a while before doing the next line because
+                    # rapidly switching lines causes severe ghosting
+                    m.d.comb += idle_ctr.reset.eq(0)
+                    m.next = "WAIT"
+
+            with m.State("WAIT"):
+                # just wait some time
+                m.d.comb += idle_ctr.reset.eq(0)
+                with m.If(idle_ctr.at_min):
+                    m.next = "STARTLINE"
 
         return m
 
@@ -287,7 +295,14 @@ class PixelBuffer(Elaboratable):
         # what color that pixel is
         self.o_pixel = Signal()
 
-        self.mem = Memory(width=8, depth=2**self.pixel_bits, init=[1, 1, 1])
+        init = []
+        for a in range(8):
+            init.append(1)
+            for b in range(32):
+                init.append(0)
+        init = init[:2**self.pixel_bits]
+
+        self.mem = Memory(width=8, depth=2**self.pixel_bits, init=init)
 
     def elaborate(self, platform):
         m = Module()
