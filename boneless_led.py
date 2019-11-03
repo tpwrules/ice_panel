@@ -176,23 +176,105 @@ class BonelessLED(Elaboratable):
         return m
 
 def firmware():
-    period = 600000//(4*3) # 10 pixels per second?
-    return [
-        MOVI(R7, 0),
-        MOVI(R6, 1),
-    L("poke"),
-        STX(R6, R7, 0),
-        STX(R6, R7, 1),
-        STX(R6, R7, 2),
-        ADDI(R7, R7, 4),
-        MOVI(R1, period&0xffff),
-        MOVI(R2, (period>>16)+1),
-    L("loop"),
-        SUBI(R1, R1, 1),
-        SBBI(R2, R2, 0),
-        JNZ ("loop"),
-        J   ("poke"),
+    period = 12000000//(4*3) # 10 pixels per second?
+    curr_color = R7
+    curr_font_data = R6
+    curr_msg_ptr = R5
+    curr_fb_ptr = R4
+    ch_pixels_remaining = R3
+    proc_ptr = R2
+    temp1 = R0
+    temp2 = R1
+    fw = [
+        MOVI(curr_color, 1),
+    L("display_msg"),
+        # point to top row
+        MOVI(curr_msg_ptr, 0),
+        MOVI(curr_fb_ptr, 0),
+        # first 5 characters of message
+        MOVR(temp1, "lol_self_mod"),
+        LD(temp2, temp1, 0),
+        ANDI(temp2, temp2, 0x1f ^ 0xFFFF),
+        ST(temp2, temp1, 0),
+        JAL(proc_ptr, "display_msg_row"),
+        # then bottom row
+        MOVI(curr_msg_ptr, 0),
+        # second 5 characters of message
+        MOVR(temp1, "lol_self_mod"),
+        LD(temp2, temp1, 0),
+        ORI(temp2, temp2, 5),
+        ST(temp2, temp1, 0),
+        MOVI(curr_fb_ptr, (32*8*4)),
+        JAL(proc_ptr, "display_msg_row"),
+        # wait some time for the message to show
+        MOVI(temp1, period&0xffff),
+        MOVI(temp2, (period>>16)+1),
+    L("delay"),
+        SUBI(temp1, temp1, 1),
+        SBBI(temp2, temp2, 0),
+        JNZ ("delay"),
+        # then switch colors and do it again
+        ADDI(curr_color, curr_color, 1),
+        J   ("display_msg"),
+
+    L("display_msg_row"),
+        # load the current character
+        MOVR(temp1, "message"),
+        ADD(temp1, temp1, curr_msg_ptr),
+    L("lol_self_mod"),
+        LD(temp1, temp1, 0), # 0 gets modified!!!
+        # then its font data
+        SLLI(temp1, temp1, 3), # make room for row
+        ANDI(temp2, curr_fb_ptr, 7<<7), # pull it out of the framebuffer pointer
+        SRLI(temp2, temp2, 7),
+        OR(temp1, temp1, temp2),
+        MOVR(temp2, "fontdata"),
+        ADD(temp1, temp1, temp2),
+        LD(curr_font_data, temp1, 0),
+        MOVI(ch_pixels_remaining, 6),
+    L("display_ch_row"),
+        # assume this pixel is off
+        MOVI(temp2, 0),
+        ANDI(temp1, curr_font_data, 0x80), # is this pixel on?
+        JZ("display_ch_row_off"), # nah
+        ANDI(temp2, curr_color, curr_color), # oh wait it is
+    L("display_ch_row_off"),
+        # pull out the colors and write them to this pixel location
+        STX(temp2, curr_fb_ptr, 0),
+        SRLI(temp2, temp2, 1),
+        STX(temp2, curr_fb_ptr, 1),
+        SRLI(temp2, temp2, 1),
+        STX(temp2, curr_fb_ptr, 2),
+        # now move to the next pixel
+        ADDI(curr_fb_ptr, curr_fb_ptr, 4),
+        SLLI(curr_font_data, curr_font_data, 1),
+        # done with this character?
+        SUBI(ch_pixels_remaining, ch_pixels_remaining, 1),
+        JNZ("display_ch_row"),
+        ADDI(curr_msg_ptr, curr_msg_ptr, 1), # move to next message character
+        CMPI(curr_msg_ptr, 5), # done with this row?
+        JNZ("display_msg_row"),
+        # move to the next pixel row
+        ADDI(curr_fb_ptr, curr_fb_ptr, (32-(6*5))*4), # skip last two pixels
+        MOVI(curr_msg_ptr, 0),
+        ANDI(temp1, curr_fb_ptr, 7<<7), # done with the pixel rows?
+        JNZ("display_msg_row"),
+        JR(proc_ptr, 0),
     ]
+    # add the data as exti instructions since i don't immediately know
+    # how to do a .data or something in this mode
+    fw.append(L("message"))
+    for m in "helloworld":
+        fw.append(EXTI(ord(m)-ord('d')))
+
+    fw.append(L("fontdata"))
+
+    from font import tft_font
+    for ch in range(ord('d'), ord('w')+1): # W is the latest char we need
+        for row in range(8):
+            fw.append(EXTI(tft_font[ch*8+row]))
+
+    return fw
 
 
 if __name__ == "__main__":
@@ -201,6 +283,6 @@ if __name__ == "__main__":
 
 # if __name__ == "__main__":
 #     from nmigen.cli import main
-#     design = IceBlink(panel_shape=(32, 16))
+#     design = BonelessLED(panel_shape=(32, 16))
 #     main(design, platform=ICEBreakerPlatform(),
 #         ports=[v for k, v in design.__dict__.items() if k.startswith("p_") ])
