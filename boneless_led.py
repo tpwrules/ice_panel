@@ -19,7 +19,7 @@ class BonelessLED(Elaboratable):
         self.bpp = 8
 
         self.panel = BufferedHUB75(panel_shape, led_domain=led_domain,
-            bpp=self.bpp, gamma=2.5, gamma_bpp=11)
+            bpp=self.bpp, gamma=2.5, gamma_bpp=10)
 
         self.cpu_rom = Memory(width=16, depth=256,
             init=Instr.assemble(firmware(self.bpp)))
@@ -212,6 +212,6 @@ if __name__ == "__main__":
 
 # if __name__ == "__main__":
 #     from nmigen.cli import main
-#     design = Top(panel_shape=(32, 16), led_freq_mhz=12, bpp=9)
+#     design = Top(panel_shape=(32, 16), led_freq_mhz=12)
 #     main(design, platform=ICEBreakerPlatform(),
 #         ports=[v for k, v in design.__dict__.items() if k.startswith("p_") ])

@@ -241,15 +241,17 @@ class FrameTimingGenerator(Elaboratable):
         # should the position counters be counting? the state machine says no if
         # we are waiting for the line to be displayed.
         should_count = Signal()
+        should_count_row = Signal()
         m.d.comb += [
-        col_ctr.enable.eq(should_count),
+            col_ctr.enable.eq(should_count),
             # count bit when column counter expires
             bit_ctr.enable.eq(col_ctr.at_max & should_count),
             # count row when bit reaches its maximum.
             # bpp might not be a power of 2, so we have to explicitly check
             # instead of waiting for rollover.
-            row_ctr.enable.eq((bit_ctr.value == self.bpp-1) & should_count),
-            bit_ctr.reset.eq((bit_ctr.value == self.bpp-1) & should_count),
+            should_count_row.eq((bit_ctr.value == self.bpp-1) & bit_ctr.enable),
+            row_ctr.enable.eq(should_count_row),
+            bit_ctr.reset.eq(should_count_row),
         ]
 
         # the line time counter counts every time the line cycle counter
