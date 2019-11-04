@@ -120,14 +120,17 @@ def firmware(bpp):
         MOVI(temp2, 0), # assume this pixel is off
         ANDI(temp1, curr_font_data, 0x80), # but maybe it's on?
         JZ("display_ch_row_pix_off"), # nah
-        AND(temp2, curr_color, curr_color), # oh wait it is
+         # oh wait it is. ramp color up and down all cool-like
+        ANDI(temp2, curr_color, 0xFF),
+        ANDI(temp1, curr_color, 0x100),
+        JZ("display_ch_row_pix_off"),
+        SUBI(temp1, temp1, 1),
+        SUB(temp2, temp1, temp2),
     L("display_ch_row_pix_off"),
-        # pull out the colors and write them to the framebuffer
-        STX(temp2, curr_fb_ptr, 0),
-        SRLI(temp2, temp2, bpp),
-        STX(temp2, curr_fb_ptr, 1), # bit 1 is green
-        SRLI(temp2, temp2, bpp),
-        STX(temp2, curr_fb_ptr, 2), # bit 2 is blue
+        # write the intensity as white to the frame buffer
+        STX(temp2, curr_fb_ptr, 0), # word 0 is red
+        STX(temp2, curr_fb_ptr, 1), # word 1 is green
+        STX(temp2, curr_fb_ptr, 2), # word 2 is blue
         # then move to the next pixel
         ADDI(curr_fb_ptr, curr_fb_ptr, 4),
         SLLI(curr_font_data, curr_font_data, 1),
