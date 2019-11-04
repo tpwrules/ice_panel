@@ -26,7 +26,7 @@ class BonelessLED(Elaboratable):
         self.panel = BufferedHUB75(panel_shape, led_domain=led_domain, bpp=bpp)
 
         self.cpu_rom = Memory(width=16, depth=256,
-            init=Instr.assemble(firmware()))
+            init=Instr.assemble(firmware(bpp)))
         self.cpu_core = CoreFSM(alsru_cls=ALSRU_4LUT, memory=self.cpu_rom)
 
     def elaborate(self, platform):
@@ -45,10 +45,10 @@ class BonelessLED(Elaboratable):
 
         return m
 
-def firmware():
+def firmware(bpp):
     # time between color changes
     # 1 second of clocks / (4 clocks per insn * 3 delay loop insns)
-    period = 12000000//(4*3)
+    period = 1200//(4*3)
     curr_color = R7
     curr_font_data = R6
     curr_msg_ptr = R5
@@ -58,7 +58,7 @@ def firmware():
     temp1 = R0
     temp2 = R1
     fw = [
-        MOVI(curr_color, 1),
+        MOVI(curr_color, 0),
     L("display_msg"),
         # draw first half of message on top half of screen
         MOVI(curr_msg_ptr, 0),
@@ -123,13 +123,13 @@ def firmware():
         MOVI(temp2, 0), # assume this pixel is off
         ANDI(temp1, curr_font_data, 0x80), # but maybe it's on?
         JZ("display_ch_row_pix_off"), # nah
-        ANDI(temp2, curr_color, curr_color), # oh wait it is
+        AND(temp2, curr_color, curr_color), # oh wait it is
     L("display_ch_row_pix_off"),
         # pull out the colors and write them to the framebuffer
-        STX(temp2, curr_fb_ptr, 0), # bit 0 is red
-        SRLI(temp2, temp2, 1),
+        STX(temp2, curr_fb_ptr, 0),
+        SRLI(temp2, temp2, bpp),
         STX(temp2, curr_fb_ptr, 1), # bit 1 is green
-        SRLI(temp2, temp2, 1),
+        SRLI(temp2, temp2, bpp),
         STX(temp2, curr_fb_ptr, 2), # bit 2 is blue
         # then move to the next pixel
         ADDI(curr_fb_ptr, curr_fb_ptr, 4),
@@ -212,11 +212,11 @@ class Top(Elaboratable):
 
 
 if __name__ == "__main__":
-    design = Top(panel_shape=(32, 16), led_freq_mhz=40, bpp=1)
+    design = Top(panel_shape=(32, 16), led_freq_mhz=40, bpp=11)
     ICEBreakerPlatform().build(design, do_program=True)
 
 # if __name__ == "__main__":
 #     from nmigen.cli import main
-#     design = BonelessLED(panel_shape=(32, 16))
+#     design = Top(panel_shape=(32, 16), led_freq_mhz=12, bpp=9)
 #     main(design, platform=ICEBreakerPlatform(),
 #         ports=[v for k, v in design.__dict__.items() if k.startswith("p_") ])

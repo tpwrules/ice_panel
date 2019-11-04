@@ -159,9 +159,9 @@ class FrameTimingGenerator(Elaboratable):
         self.i_rgb1 = Signal(3)
 
         self.row_bits = (panel_shape[1]//2-1).bit_length()
-        self.col_bits = (panel_shape[0]-1).bit_length()
         # index the bit of the pixel
         self.bit_bits = (bpp-1).bit_length()
+        self.col_bits = (panel_shape[0]-1).bit_length()
 
         # what pixel we are addressing
         self.o_row = Signal(self.row_bits)
@@ -180,15 +180,28 @@ class FrameTimingGenerator(Elaboratable):
         self.o_blank = self.ltg.o_blank
         self.o_line_addr = self.ltg.o_line_addr
 
-        self.pixel_ctr = UpCounter(self.col_bits+self.row_bits, init=0)
-        self.idle_ctr = UpCounter(14, init=0)
+        self.col_ctr = UpCounter(self.col_bits)
+        self.bit_ctr = UpCounter(self.bit_bits)
+        self.row_ctr = UpCounter(self.row_bits)
+
+        # brightness control. split into two counters so we can have the actual
+        # line take a non-power-of-two time.
+        # count number of cycles in the line. line generator takes 4 cycles
+        # between lines to switch.
+        self.num_line_cycles = panel_shape[0]+4
+        self.line_cycle_ctr = UpCounter((self.num_line_cycles-1).bit_length())
+        # then number of line times so we can keep track of brightness
+        self.line_times_ctr = UpCounter(self.bpp)
 
     def elaborate(self, platform):
         m = Module()
         # register submodules (and make a local reference without self)
         m.submodules.ltg = ltg = self.ltg
-        m.submodules.pixel_ctr = pixel_ctr = self.pixel_ctr
-        m.submodules.idle_ctr = idle_ctr = self.idle_ctr
+        m.submodules.col_ctr = col_ctr = self.col_ctr
+        m.submodules.bit_ctr = bit_ctr = self.bit_ctr
+        m.submodules.row_ctr = row_ctr = self.row_ctr
+        m.submodules.line_cycle_ctr = line_cycle_ctr = self.line_cycle_ctr
+        m.submodules.line_times_ctr = line_times_ctr = self.line_times_ctr
 
         # there are always three pixels in motion. the address of the most
         # recent pixel is output to o_row and o_col for whatever is calculating
@@ -216,24 +229,51 @@ class FrameTimingGenerator(Elaboratable):
             self.o_rgb1.eq(disp_rgb1),
         ]
 
-        # address the pixel pointed to by the pixel counter
+        # address the pixel pointed to by the position counters
         m.d.comb += [
-            self.o_col.eq(pixel_ctr.value[:self.col_bits]),
-            self.o_row.eq(pixel_ctr.value[self.col_bits:]),
+            self.o_col.eq(col_ctr.value),
+            self.o_bit.eq(bit_ctr.value),
+            self.o_row.eq(row_ctr.value),
         ]
 
-        # state machine variables
-        should_idle = Signal() # should the line generator be idling?
-        should_count = Signal() # should the pixel counter be counting?
+        # the position counters count columns, bits, then rows. we do the rows
+        # last because switching rows too fast causes ghosting.
+        # should the position counters be counting? the state machine says no if
+        # we are waiting for the line to be displayed.
+        should_count = Signal()
         m.d.comb += [
-            ltg.i_idle.eq(should_idle),
-            pixel_ctr.enable.eq(should_count),
+        col_ctr.enable.eq(should_count),
+            # count bit when column counter expires
+            bit_ctr.enable.eq(col_ctr.at_max & should_count),
+            # count row when bit reaches its maximum.
+            # bpp might not be a power of 2, so we have to explicitly check
+            # instead of waiting for rollover.
+            row_ctr.enable.eq((bit_ctr.value == self.bpp-1) & should_count),
+            bit_ctr.reset.eq((bit_ctr.value == self.bpp-1) & should_count),
         ]
+
+        # the line time counter counts every time the line cycle counter
+        # finishes a line
+        m.d.comb += [
+            line_times_ctr.enable.eq(
+                line_cycle_ctr.value == self.num_line_cycles-1),
+            line_cycle_ctr.reset.eq(
+                line_cycle_ctr.value == self.num_line_cycles-1),
+        ]
+        # we compare it with which bit of the pixel we are processing
+        bitmasker = Decoder(self.bpp)
+        m.submodules.bitmasker = bitmasker
+        m.d.comb += bitmasker.i.eq(self.o_bit)
+
+        should_idle = Signal() # should the line generator be idling?
+        m.d.comb += ltg.i_idle.eq(should_idle)
+
         # by default:
         m.d.comb += [
             should_idle.eq(1),
             should_count.eq(0),
-            idle_ctr.reset.eq(1),
+            line_cycle_ctr.reset.eq(0),
+            line_times_ctr.reset.eq(0),
         ]
 
         with m.FSM("STARTLINE") as fsm:
@@ -245,6 +285,14 @@ class FrameTimingGenerator(Elaboratable):
                 # counter so we address the second on the next cycle, and have
                 # the first calculating when we transition into DOLINE.
                 m.d.comb += should_count.eq(1)
+
+                # reset the line counters. since we do it here, it will
+                # be one cycle ahead of the actual line output but that's okay.
+                m.d.comb += [
+                    line_cycle_ctr.reset.eq(1),
+                    line_times_ctr.reset.eq(1),
+                ]
+
                 m.next = "DOLINE"
 
             with m.State("DOLINE"):
@@ -256,33 +304,26 @@ class FrameTimingGenerator(Elaboratable):
 
                 # don't idle the line generator
                 m.d.comb += should_idle.eq(0)
-                # keep on counting the pixels throughout the line
-                m.d.comb += should_count.eq(1)
 
                 # are we addressing the last pixel?
-                with m.If(~pixel_ctr.value[:self.col_bits] == 0):
+                with m.If(col_ctr.at_max):
                     # yes, tell the line generator what row it should update
                     # whenever it finishes
-                    m.d.sync += ltg.i_line_addr.eq(
-                        pixel_ctr.value[self.col_bits:])
-                    # address the first pixel of the next line
-                    m.d.comb += should_count.eq(1)
+                    m.d.sync += ltg.i_line_addr.eq(self.row_ctr.value)
                     # and wait for this line to end
-                    m.next = "ENDLINE"
-
-            with m.State("ENDLINE"):
-                # wait for the line to be latched so we know it's finished
-                with m.If(self.ltg.o_latch):
-                    # we want to wait a while before doing the next line because
-                    # rapidly switching lines causes severe ghosting
-                    m.d.comb += idle_ctr.reset.eq(0)
                     m.next = "WAIT"
+                with m.Else():
+                    # keep on counting the pixels throughout the line
+                    m.d.comb += should_count.eq(1)
+                    # once we're finished, we don't count any more so we remain
+                    # on this line.
 
             with m.State("WAIT"):
-                # just wait some time
-                m.d.comb += idle_ctr.reset.eq(0)
-                with m.If(idle_ctr.at_min):
-                    # once expired, go do the same thing for the next line
+                # have we finished with this brightness?
+                with m.If(bitmasker.o & line_times_ctr.value):
+                    # yes, address the first pixel of the next line
+                    m.d.comb += should_count.eq(1)
+                    # and go start it
                     m.next = "STARTLINE"
 
         return m
