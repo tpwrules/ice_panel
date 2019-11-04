@@ -385,9 +385,38 @@ class PixelBuffer(Elaboratable):
 
 # a whole screen and buffer
 class BufferedHUB75(Elaboratable):
-    def __init__(self, panel_shape, led_domain="sync", bpp=1):
+    def __init__(self, panel_shape, led_domain="sync", bpp=1,
+            gamma=None, gamma_bpp=None):
         self.panel_shape = panel_shape
+        # gamma correction.
+        # gamma is the exponent of the gamma curve, or None to disable.
+        # if gamma is enabled, bpp bits look up a gamma_bpp wide table.
+        # if gamma_bpp is none, gamma_bpp = bpp
+        self.gamma = gamma
         self.bpp = bpp # number of bits per color per pixel
+        if gamma is not None and gamma_bpp is not None:
+            self.gamma_bpp = gamma_bpp
+        else:
+            self.gamma_bpp = bpp
+
+        if self.bpp < 1 or self.gamma_bpp < 1:
+            raise Exception(
+                "who would even have a {}-color display?".format(
+                    min(2**self.bpp, 2**self.gamma_bpp)))
+        elif self.bpp > 16 or self.gamma_bpp > 16:
+            raise Exception("{}bpp? now that's just greedy".format(
+                max(self.bpp, self.gamma_bpp)))
+
+        if self.gamma is not None:
+            # generate the gamma table from the given parameters
+            in_scale = 2**self.bpp-1
+            out_scale = 2**self.gamma_bpp-1
+            table = []
+            for x in range(2**self.bpp):
+                table.append(int(((x/in_scale)**self.gamma)*out_scale))
+            self.gamma_table = Memory(
+                width=self.gamma_bpp, depth=2**self.bpp, init=table)
+
         # what domain to run the LED engine in. framebuffers will still be
         # written to from sync.
         self.led_domain = led_domain
@@ -418,12 +447,12 @@ class BufferedHUB75(Elaboratable):
         self.pbs = {}
         for name in self.pb_names:
             self.pbs[name] = PixelBuffer(panel_shape,
-                led_domain=self.led_domain, bpp=self.bpp)
+                led_domain=self.led_domain, bpp=self.gamma_bpp)
 
         # and have a mechanism to actually generate the display
         # (display generation happens in the LED clock domain)
         self.ftg = DomainRenamer(self.led_domain)(
-            FrameTimingGenerator(panel_shape, bpp=self.bpp))
+            FrameTimingGenerator(panel_shape, bpp=self.gamma_bpp))
 
     def elaborate(self, platform):
         # get the display from the platform.
@@ -442,11 +471,30 @@ class BufferedHUB75(Elaboratable):
         b_we = Signal.like(self.i_we)
         b_waddr = Signal.like(self.i_waddr)
         b_wdata = Signal.like(self.i_wdata)
+        # and once more, so we can gamma correct the data
+        g_we = Signal.like(self.i_we)
+        g_waddr = Signal.like(self.i_waddr)
+        g_wdata = Signal(self.gamma_bpp)
         m.d.sync += [ # comes from memory write domain i.e. sync
             b_we.eq(self.i_we),
             b_waddr.eq(self.i_waddr),
             b_wdata.eq(self.i_wdata),
+            # gamma correction doesn't modify WE or address
+            g_we.eq(b_we),
+            g_waddr.eq(b_waddr),
         ]
+
+        if self.gamma is None:
+            # just pass data through
+            m.d.sync += g_wdata.eq(b_wdata)
+        else:
+            # wire through gamma lookup table
+            g_rdport = self.gamma_table.read_port()
+            m.submodules += g_rdport
+            m.d.comb += [
+                g_rdport.addr.eq(b_wdata),
+                g_wdata.eq(g_rdport.data),
+            ]
 
         # split the write address into the various pixel addresses
         addr_color = Signal(2)
@@ -455,10 +503,10 @@ class BufferedHUB75(Elaboratable):
         addr_half = Signal()
         row_bits, col_bits = self.row_bits, self.col_bits
         m.d.comb += [
-            addr_color.eq(b_waddr[:2]),
-            addr_col.eq(b_waddr[2:2+col_bits]),
-            addr_row.eq(b_waddr[2+col_bits:2+col_bits+row_bits]),
-            addr_half.eq(b_waddr[2+col_bits+row_bits]),
+            addr_color.eq(g_waddr[:2]),
+            addr_col.eq(g_waddr[2:2+col_bits]),
+            addr_row.eq(g_waddr[2+col_bits:2+col_bits+row_bits]),
+            addr_half.eq(g_waddr[2+col_bits+row_bits]),
         ]
 
         # then wire up those addresses to the pixel buffers
@@ -469,9 +517,9 @@ class BufferedHUB75(Elaboratable):
                 color_en.eq(addr_color == "rgb".index(name[0])),
                 half_en.eq(addr_half == "01".index(name[1])),
 
-                buffer.i_we.eq(color_en & half_en & b_we),
+                buffer.i_we.eq(color_en & half_en & g_we),
                 buffer.i_waddr.eq(Cat(addr_col, addr_row)),
-                buffer.i_wdata.eq(b_wdata),
+                buffer.i_wdata.eq(g_wdata),
             ]
 
         # tell the buffers what pixel the frame generator wants
