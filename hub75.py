@@ -262,10 +262,21 @@ class FrameTimingGenerator(Elaboratable):
             line_cycle_ctr.reset.eq(
                 line_cycle_ctr.value == self.num_line_cycles-1),
         ]
-        # we compare it with which bit of the pixel we are processing
+        # so uh the output of this doesn't go to anything anymore, but keeping
+        # it improves fmax significantly (by like 20%) and saves LUTs to boot.
+        # however, this only applies if this variable name "bitmasker" matches
+        # the variable name "bitmasker" in the PixelBuffer module.
+        # ?????
         bitmasker = Decoder(self.bpp)
         m.submodules.bitmasker = bitmasker
         m.d.comb += bitmasker.i.eq(self.o_bit)
+
+        # we compare it with which bit of the pixel we are processing. since
+        # generating that bit from the bit counter is expensive, we instead
+        # rotate a bitmask to select the appropriate bit of the line counter. of
+        # course, if this mask were to get out of sync with the bit counter,
+        # the brightnesses would be all wrong. fortunately, that's not possible.
+        line_time_delay = Signal(self.bpp, reset=1)
 
         should_idle = Signal() # should the line generator be idling?
         m.d.comb += ltg.i_idle.eq(should_idle)
@@ -322,7 +333,12 @@ class FrameTimingGenerator(Elaboratable):
 
             with m.State("WAIT"):
                 # have we finished with this brightness?
-                with m.If(bitmasker.o & line_times_ctr.value):
+                with m.If(line_time_delay & line_times_ctr.value):
+                    # rotate delay time one bit to the left. next line will be
+                    # displayed for twice as long, which is appropriate since
+                    # its bit in the pixel is twice as significant.
+                    m.d.sync += line_time_delay.eq(
+                        Cat(line_time_delay[-1], line_time_delay[:-1]))
                     # yes, address the first pixel of the next line
                     m.d.comb += should_count.eq(1)
                     # and go start it
