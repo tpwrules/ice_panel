@@ -211,7 +211,7 @@ class Top(Elaboratable):
 
 if __name__ == "__main__":
     design = Top(panel_shape=(32, 16), led_freq_mhz=40)
-    ICEBreakerPlatform().build(design, do_program=True)
+    ICEBreakerPlatform().build(design, do_program=True, synth_opts="-abc9")
 
 # if __name__ == "__main__":
 #     from nmigen.cli import main
