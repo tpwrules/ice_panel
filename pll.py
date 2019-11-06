@@ -7,13 +7,14 @@ from nmigen import *
 from nmigen.lib.cdc import ResetSynchronizer
 from nmigen.cli import main
 
+# original code https://github.com/kbob/nmigen-examples/blob/master/lib/pll.py
 
 class PLL(Elaboratable):
 
     """
     Instantiate the iCE40's phase-locked loop (PLL).
 
-    This uses the iCE40's SB_PLL40_PAD primitive in simple feedback
+    This uses the iCE40's SB_PLL40_2_PAD primitive in simple feedback
     mode.
 
     The reference clock is directly connected to a package pin. To
@@ -22,7 +23,7 @@ class PLL(Elaboratable):
 
         clk_pin = platform.request('clk12', dir='-')
 
-    The PLL passes the original clock through to the orig_domain_name domain,
+    The PLL passes the input clock through to the orig_domain_name domain,
     then outputs the new clock to the pll_domain_name domain.
 
     This module also has a reset synchronizer -- the domain's reset line
@@ -90,7 +91,7 @@ class PLL(Elaboratable):
         m.submodules += pll
         m.submodules += ResetSynchronizer(
             ~self.pll_lock, domain=self.pll_domain_name)
-        # there should be a resetsynchronizer for the original domain too, but
+        # there should be a reset synchronizer for the original domain too, but
         # making one breaks nmigen for some reason.
         # m.submodules += ResetSynchronizer(
         #     ~self.pll_lock, domain=self.orig_domain_name)
