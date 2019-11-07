@@ -8,6 +8,7 @@
 
 from nmigen import *
 from nmigen.lib.coding import Decoder
+from nmigen.lib.fifo import AsyncFIFO
 
 class UpCounter(Elaboratable):
     def __init__(self, width, init=0):
@@ -348,11 +349,9 @@ class FrameTimingGenerator(Elaboratable):
 
 # buffer one channel for the whole panel in BRAM at an arbitrary bpp
 class PixelBuffer(Elaboratable):
-    def __init__(self, panel_shape, led_domain="sync", bpp=1):
+    def __init__(self, panel_shape, bpp=1):
         self.panel_shape = panel_shape
         self.bpp = bpp # number of bits per pixel
-        # the memory read happens in the LED domain
-        self.led_domain = led_domain
 
         # calculate address widths
         self.row_bits = (panel_shape[1]//2-1).bit_length()
@@ -378,8 +377,7 @@ class PixelBuffer(Elaboratable):
     def elaborate(self, platform):
         m = Module()
         # register submodules (and make a local reference without self)
-        m.submodules.rdport = rdport = self.mem.read_port(
-            domain=self.led_domain, transparent=False)
+        m.submodules.rdport = rdport = self.mem.read_port()
         m.submodules.wrport = wrport = self.mem.write_port()
 
         # write port goes straight to the memory
@@ -464,13 +462,19 @@ class BufferedHUB75(Elaboratable):
         self.pb_names = ("r0", "g0", "b0", "r1", "g1", "b1")
         self.pbs = {}
         for name in self.pb_names:
-            self.pbs[name] = PixelBuffer(panel_shape,
-                led_domain=self.led_domain, bpp=self.gamma_bpp)
+            self.pbs[name] = DomainRenamer(self.led_domain)(
+                PixelBuffer(panel_shape, bpp=self.gamma_bpp))
 
         # and have a mechanism to actually generate the display
         # (display generation happens in the LED clock domain)
         self.ftg = DomainRenamer(self.led_domain)(
             FrameTimingGenerator(panel_shape, bpp=self.gamma_bpp))
+
+        # FIFO for pixel writes to the buffer. necessary to prevent
+        # metastability in the buffer RAMs from causing display glitches. it
+        # doesn't need to be deep because we can quickly read it.
+        self.wr_fifo = AsyncFIFO(width=self.addr_bits+self.bpp, depth=4,
+            w_domain="sync", r_domain=self.led_domain)
 
     def elaborate(self, platform):
         # get the display from the platform.
@@ -479,24 +483,37 @@ class BufferedHUB75(Elaboratable):
         
         m = Module()
         m.submodules.ftg = ftg = self.ftg
+        m.submodules.wr_fifo = wr_fifo = self.wr_fifo
         pbs = self.pbs
         for name, buffer in pbs.items():
             # register all the buffers we made
             setattr(m.submodules, name, buffer)
 
-        # handle the write data input
-        # buffer them so we can decode at our leisure
+        # handle the write data input by immediately sticking it in the FIFO for
+        # the LED domain to handle
+        m.d.sync += [
+            wr_fifo.w_en.eq(self.i_we),
+            wr_fifo.w_data.eq(Cat(self.i_waddr, self.i_wdata)),
+        ]
+
+        # once it pops back out, we latch it into another buffer for
+        # metastability prevention.
         b_we = Signal.like(self.i_we)
         b_waddr = Signal.like(self.i_waddr)
         b_wdata = Signal.like(self.i_wdata)
-        # and once more, so we can gamma correct the data
+        # r_rdy gets asserted when there is data to be read. we want it ASAP.
+        m.d.comb += wr_fifo.r_en.eq(wr_fifo.r_rdy)
+        # the data will be ready on r_data...
+        m.d.comb += Cat(b_waddr, b_wdata).eq(wr_fifo.r_data)
+        # the cycle after r_rdy is asserted.
+        m.d[self.led_domain] += b_we.eq(wr_fifo.r_rdy)
+
+
+        # now we can gamma correct the data
         g_we = Signal.like(self.i_we)
         g_waddr = Signal.like(self.i_waddr)
         g_wdata = Signal(self.gamma_bpp)
-        m.d.sync += [ # comes from memory write domain i.e. sync
-            b_we.eq(self.i_we),
-            b_waddr.eq(self.i_waddr),
-            b_wdata.eq(self.i_wdata),
+        m.d[self.led_domain] += [
             # gamma correction doesn't modify WE or address
             g_we.eq(b_we),
             g_waddr.eq(b_waddr),
@@ -504,10 +521,10 @@ class BufferedHUB75(Elaboratable):
 
         if self.gamma is None:
             # just pass data through
-            m.d.sync += g_wdata.eq(b_wdata)
+            m.d[self.led_domain] += g_wdata.eq(b_wdata)
         else:
             # wire through gamma lookup table
-            g_rdport = self.gamma_table.read_port()
+            g_rdport = self.gamma_table.read_port(domain=self.led_domain)
             m.submodules += g_rdport
             m.d.comb += [
                 g_rdport.addr.eq(b_wdata),
