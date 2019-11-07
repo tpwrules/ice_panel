@@ -473,7 +473,7 @@ class BufferedHUB75(Elaboratable):
         # FIFO for pixel writes to the buffer. necessary to prevent
         # metastability in the buffer RAMs from causing display glitches. it
         # doesn't need to be deep because we can quickly read it.
-        self.wr_fifo = AsyncFIFO(width=self.addr_bits+self.bpp, depth=4,
+        self.wr_fifo = AsyncFIFO(width=self.addr_bits+self.bpp, depth=1024,
             w_domain="sync", r_domain=self.led_domain)
 
     def elaborate(self, platform):
@@ -501,12 +501,22 @@ class BufferedHUB75(Elaboratable):
         b_we = Signal.like(self.i_we)
         b_waddr = Signal.like(self.i_waddr)
         b_wdata = Signal.like(self.i_wdata)
+        # turns out that if we write to the pixel memory while that line is
+        # being displayed, the display can glitch, presumably because it's drawn
+        # as bitplanes and it looks weird if the pixel changes halfway through
+        # the bits.
+        should_read = Signal()
         # r_rdy gets asserted when there is data to be read. we want it ASAP.
-        m.d.comb += wr_fifo.r_en.eq(wr_fifo.r_rdy)
+        m.d.comb += wr_fifo.r_en.eq(wr_fifo.r_rdy & should_read)
         # the data will be ready on r_data...
         m.d.comb += Cat(b_waddr, b_wdata).eq(wr_fifo.r_data)
         # the cycle after r_rdy is asserted.
-        m.d[self.led_domain] += b_we.eq(wr_fifo.r_rdy)
+        m.d[self.led_domain] += b_we.eq(wr_fifo.r_rdy & should_read)
+        # only complete the read if the destination row doesn't match the
+        # currently displayed row
+        row_bits, col_bits = self.row_bits, self.col_bits
+        m.d.comb += should_read.eq(
+            (b_waddr[2+col_bits:2+col_bits+row_bits] != self.ftg.o_row))
 
 
         # now we can gamma correct the data
@@ -515,7 +525,7 @@ class BufferedHUB75(Elaboratable):
         g_wdata = Signal(self.gamma_bpp)
         m.d[self.led_domain] += [
             # gamma correction doesn't modify WE or address
-            g_we.eq(b_we),
+            g_we.eq(b_we & should_read),
             g_waddr.eq(b_waddr),
         ]
 
@@ -536,7 +546,6 @@ class BufferedHUB75(Elaboratable):
         addr_row = Signal(self.row_bits)
         addr_col = Signal(self.col_bits)
         addr_half = Signal()
-        row_bits, col_bits = self.row_bits, self.col_bits
         m.d.comb += [
             addr_color.eq(g_waddr[:2]),
             addr_col.eq(g_waddr[2:2+col_bits]),

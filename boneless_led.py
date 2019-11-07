@@ -44,7 +44,7 @@ class BonelessLED(Elaboratable):
 def firmware(bpp):
     # time between color changes
     # 1 second of clocks / (4 clocks per insn * 3 delay loop insns)
-    period = 120000//(4*3)
+    period = 1#120000//(4*3)
     curr_color = R7
     curr_font_data = R6
     curr_msg_ptr = R5
@@ -90,8 +90,7 @@ def firmware(bpp):
 
         # then switch colors and do it again
         ADDI(curr_color, curr_color, 1),
-        CMPI(curr_color, 2**bpp),
-        JNZ   ("display_msg"),
+        J   ("display_msg"),
 
     L("display_msg_row"),
         # we write to the display one row at a time to save index pointers.
@@ -119,7 +118,7 @@ def firmware(bpp):
     L("display_ch_row"),
         MOVI(temp2, 0), # assume this pixel is off
         ANDI(temp1, curr_font_data, 0x80), # but maybe it's on?
-        JZ("display_ch_row_pix_off"), # nah
+        JZ("no_pix"), # skip drawing 0 pixels to avoid filling up FIFO
          # oh wait it is. ramp color up and down all cool-like
         ANDI(temp2, curr_color, 0xFF),
         ANDI(temp1, curr_color, 0x100),
@@ -131,6 +130,7 @@ def firmware(bpp):
         STX(temp2, curr_fb_ptr, 0), # word 0 is red
         STX(temp2, curr_fb_ptr, 1), # word 1 is green
         STX(temp2, curr_fb_ptr, 2), # word 2 is blue
+    L("no_pix"),
         # then move to the next pixel
         ADDI(curr_fb_ptr, curr_fb_ptr, 4),
         SLLI(curr_font_data, curr_font_data, 1),
