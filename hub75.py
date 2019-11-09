@@ -261,7 +261,8 @@ class FrameTimingGenerator(Elaboratable):
 
         # if we're counting a new row, then we have finished the current one and
         # should update if we are doing an odd row or not.
-        m.d.sync += self.o_odd_line.eq(~self.o_odd_line)
+        with m.If(should_count_row):
+            m.d.sync += self.o_odd_line.eq(~self.o_odd_line)
 
         # the line time counter counts every time the line cycle counter
         # finishes a line
@@ -367,7 +368,7 @@ class PixelReader(Elaboratable):
         self.row_bits = (panel_shape[1]//2-1).bit_length()
         self.col_bits = (panel_shape[0]-1).bit_length()
         self.bit_bits = (bpp-1).bit_length()
-        self.pixel_bits = self.row_bits + self.col_bits
+        self.pixel_bits = self.col_bits
         # + 1 because each address above refers to two indepdendent pixels,
         # + 2 to select pixel color channel
         self.addr_bits = self.pixel_bits + 1 + 2
@@ -391,6 +392,7 @@ class PixelReader(Elaboratable):
         self.i_row = Signal(self.row_bits)
         self.i_col = Signal(self.col_bits)
         self.i_bit = Signal(self.bit_bits)
+        self.i_odd_line = Signal()
         # what color the 6 channels of that pixel are.
         self.o_pixel = Signal(6)
 
@@ -399,12 +401,13 @@ class PixelReader(Elaboratable):
         # asserted, we latch that pixel's data in from rdata.
         self.o_re = Signal()
         self.i_rack = Signal()
-        self.o_raddr = Signal(self.addr_bits+2)
+        self.o_raddr = Signal(self.addr_bits + self.row_bits)
         self.i_rdata = Signal(self.bpp)
 
         # our buffer memory. it needs to be crazy wide so we can read 6 full
         # pixels per cycle and select the 6 bits the frame generator wants.
-        self.line_buf = Memory(width=6*self.bpp, depth=2*self.panel_shape[0])
+        self.line_buf = Memory(width=6*self.bpp, depth=2*self.panel_shape[0],
+            init=[2**(6*self.bpp)-1]*(2*self.panel_shape[0]))
 
         # counter to index the pixels when reading. we generate the half select
         # bit and channel bits elsewhere.
@@ -417,27 +420,35 @@ class PixelReader(Elaboratable):
             self.line_buf.read_port(domain=self.out_domain, transparent=False)
         # we want 6 enables so we can write 1 of 6 pixels
         m.submodules.wrport = wrport = \
-            self.line_buf.write_port(domain=self.in_domain, granularity=6)
-        m.submodules.pix_ctr = pix_ctr = self.pix_ctr
+            self.line_buf.write_port(domain=self.in_domain,
+                granularity=6*self.bpp//6)
+        m.submodules.pix_ctr = pix_ctr = \
+            DomainRenamer(self.in_domain)(self.pix_ctr)
 
+
+        curr_rd_line_in = Signal(self.row_bits)
+        curr_rd_line_sync = FFSynchronizer(i=self.i_row, o=curr_rd_line_in,
+            o_domain=self.in_domain, reset_less=False, stages=3)
+        m.submodules += curr_rd_line_sync
+        curr_rd_line = Signal(self.row_bits)
+        #m.d.comb += curr_rd_line.eq(3)
 
         # zeroth, we need to know what buffer we are on. the frame generator
         # controls that in its domain, so we need to sync it to the domain we're
         # inputting pixels in. it's okay if it's delayed a few cycles, it
         # shouldn't matter unless the reader is being stalled too much.
         fg_which_buf = Signal()
+        m.d.comb += fg_which_buf.eq(self.i_odd_line)
         pr_which_buf = Signal()
         which_buf_sync = FFSynchronizer(i=fg_which_buf, o=pr_which_buf,
             o_domain=self.in_domain, reset_less=False, stages=3)
         m.submodules.which_buf_sync = which_buf_sync
 
         # first, the pixels being read by the frame generator.
-        fg_addr = Signal(self.pixel_bits+1)
-        fg_data = Signal(6*self.pixel_bits)
+        fg_data = Signal(6*self.bpp)
         m.d.comb += [
-            fg_addr.eq(Cat(self.i_col, self.i_row, fg_which_buf)),
             # get read directly from the buffer
-            rdport.addr.eq(fg_addr),
+            rdport.addr.eq(Cat(self.i_col, fg_which_buf)),
             fg_data.eq(rdport.data),
         ]
         # then we have to select the bits from the channels that the frame
@@ -455,7 +466,7 @@ class PixelReader(Elaboratable):
         fg_wchan = Signal(3) # which channel we're writing. goes 0-5
         # combine into output address. channel bits, address bits, half bit
         m.d.comb += self.o_raddr.eq(
-            Cat(fg_rchan[:2], pix_ctr.value, fg_rchan[-1]))
+            Cat(fg_rchan[:2], pix_ctr.value, curr_rd_line, fg_rchan[-1]))
         
         should_count = Signal() # should we count to the next pixel?
         m.d.comb += self.pix_ctr.enable.eq(should_count)
@@ -464,6 +475,8 @@ class PixelReader(Elaboratable):
         done_reading = Signal() # did the pixel read finish?
         m.d.comb += done_reading.eq(self.o_re & self.i_rack)
 
+        curr_which_buf = Signal() # which buffer we're currently reading
+
         # once the pixel read finishes, we want to write it to the buffer.
         # we need to replicate the pixel across the 6 channels, then we only
         # enable the channel we got back.
@@ -471,23 +484,23 @@ class PixelReader(Elaboratable):
         m.d.comb += wrport.data.eq(Repl(wr_data, 6))
         m.d[self.in_domain] += [
             # at the address of the current pixel
-            wrport.addr.eq(pix_ctr.value),
-            # with the data we just got back
-            wr_data.eq(self.i_rdata),
+            wrport.addr.eq(Cat(pix_ctr.value, ~pr_which_buf)),
         ]
+        m.d.comb += wr_data.eq(self.i_rdata),
         # enable the appropriate channel
         for ch in range(6):
             m.d[self.in_domain] += wrport.en[ch].eq(
                 done_reading & (fg_wchan == ch))
         
         # choose which channels to read
-        curr_which_buf = Signal() # which buffer we're currently reading
+        
         with m.FSM("WAIT", domain=self.in_domain):
             with m.State("WAIT"): # wait for next line to begin
                 # i.e. the frame generator is reading the line we are working on
                 with m.If(pr_which_buf == curr_which_buf):
                     # swap buffers
                     m.d[self.in_domain] += curr_which_buf.eq(~curr_which_buf)
+                    m.d[self.in_domain] += curr_rd_line.eq(curr_rd_line_in+1)
                     # start at the first pixel
                     m.d.comb += pix_ctr.reset.eq(1)
                     # and get back into it
@@ -535,12 +548,11 @@ class PixelReader(Elaboratable):
                     should_read.eq(1),
                 ]
                 with m.If(done_reading): # have we got the data?
-                    m.d.comb += should_count.eq(1)
-                    m.next = "P0G"
+                    m.next = "P1B"
             with m.State("P1B"): # pixel 1's blue channel
                 m.d.comb += [ # set up addresses
-                    fg_rchan.eq(0),
-                    fg_wchan.eq(0),
+                    fg_rchan.eq(6),
+                    fg_wchan.eq(5),
                     should_read.eq(1),
                 ]
                 with m.If(done_reading): # have we got the data?
@@ -548,7 +560,7 @@ class PixelReader(Elaboratable):
                     with m.If(pix_ctr.at_max): # done with this line?
                         m.next = "WAIT"
                     with m.Else():
-                        m.next = "P0R"
+                        m.next = "P0R"                
 
         return m
 
@@ -618,10 +630,10 @@ class BufferedHUB75(Elaboratable):
             FrameTimingGenerator(panel_shape, bpp=self.gamma_bpp))
 
         # read pixels and give them to the frame generator
-        self.pr = PixelReader(panel_shape, bpp=self.bpp,
+        self.pr = PixelReader(panel_shape, bpp=self.gamma_bpp,
             in_domain=self.led_domain, out_domain=self.led_domain)
 
-        self.buf = Memory(width=self.gamma_bpp, depth=self.addr_bits)
+        self.buf = Memory(width=self.gamma_bpp, depth=2**self.addr_bits)
 
     def elaborate(self, platform):
         # get the display from the platform.
@@ -632,7 +644,7 @@ class BufferedHUB75(Elaboratable):
         m.submodules.ftg = ftg = self.ftg
         m.submodules.pr = pr = self.pr
         m.submodules.rdport = rdport = \
-            self.buf.read_port(domain=self.led_domain)
+            self.buf.read_port(domain=self.led_domain, transparent=False)
         m.submodules.wrport = wrport = self.buf.write_port()
 
         # handle the write data input
@@ -677,6 +689,7 @@ class BufferedHUB75(Elaboratable):
 
             rdport.addr.eq(pr.o_raddr),
             pr.i_rdata.eq(rdport.data),
+            pr.i_odd_line.eq(ftg.o_odd_line),
         ]
 
         m.d[self.led_domain] += pr.i_rack.eq(pr.o_re)
