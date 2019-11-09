@@ -46,8 +46,8 @@ _pd_fields = [
     'bpp', # number of bits per color per pixel. e.g. 8 would be 24-bit RGB.
 
     # CALCULATED PARAMETERS
-    'bit_bits', # no. bits reqd. to select a bit in a pixel, 0 to bpp-1
     'col_bits', # no. bits reqd. to select a column, 0 to (width-1)
+    'bit_bits', # no. bits reqd. to select a bit in a pixel, 0 to bpp-1
     'row_bits', # no. bits reqd. to select a row, 0 to (height//2-1)
     'pix_bits', # no. bits reqd. to select a pixel, col_bits+row_bits
     'chan_bits', # no. bits reqd. to select a physical channel of a physical
@@ -81,15 +81,15 @@ class PanelDescription(namedtuple("PanelDescription", _pd_fields)):
                 "which doesn't include {}!".format(height))
 
         # calculate the calculated parameters from the ones the user gave us
-        bit_bits = (bpp-1).bit_length()
         col_bits = (width-1).bit_length()
+        bit_bits = (bpp-1).bit_length()
         row_bits = (height//2-1).bit_length()
         pix_bits = col_bits+row_bits
         chan_bits = pix_bits+1+2
 
         return super(PanelDescription, cls).__new__(cls,
             width, height, bpp,
-            bit_bits, col_bits, row_bits,
+            col_bits, bit_bits, row_bits,
             pix_bits, chan_bits,
         )
 
@@ -141,8 +141,8 @@ class LineTimingGenerator(Elaboratable):
         # the generator will not start on the next line until deasserted. blank
         # is not asserted during idle.
         self.i_idle = Signal()
-        # which line is being displayed. latched at the end of the line or so
-        self.i_line_addr = Signal(self.pd.row_bits)
+        # which row is being displayed. latched at the end of the line or so.
+        self.i_row_sel = Signal(self.pd.row_bits)
 
         # shift active output. asserted when actively shifting pixels (and thus
         # the panel should receive the shift clock)
@@ -151,22 +151,22 @@ class LineTimingGenerator(Elaboratable):
         self.o_latch = Signal()
         # blank output, direct to panel
         self.o_blank = Signal()
-        # line address bits, direct to panel
-        self.o_line_addr = Signal.like(self.i_line_addr)
+        # row select bits, direct to panel
+        self.o_row_sel = Signal.like(self.i_row_sel)
 
-        # current pixel output
-        self.pixel_ctr = UpCounter(self.pd.col_bits, init=0)
+        # which pixel in the column we are outputting
+        self.col_ctr = UpCounter(self.pd.col_bits, init=0)
 
     def elaborate(self, platform):
         m = Module()
         # register submodules (and make a local reference without self)
-        m.submodules.pixel_ctr = pixel_ctr = self.pixel_ctr
+        m.submodules.col_ctr = col_ctr = self.col_ctr
 
         # by default:
         m.d.comb += [
             self.o_shift_active.eq(0), # not outputting pixels
-            pixel_ctr.reset.eq(1), # or counting them
-            # display is active and we aren't latching
+            col_ctr.reset.eq(1), # or counting them
+            # display is active and we aren't latching new pixels
             self.o_blank.eq(0),
             self.o_latch.eq(0),
         ]
@@ -178,11 +178,11 @@ class LineTimingGenerator(Elaboratable):
                 # keep counting pixels out
                 m.d.comb += [
                     self.o_shift_active.eq(1),
-                    pixel_ctr.reset.eq(0),
+                    col_ctr.reset.eq(0),
                 ]
 
                 # has the counter finished?
-                with m.If(pixel_ctr.at_max):
+                with m.If(col_ctr.at_max):
                     # yes, so the line is over
                     m.next = "BLANK"
 
@@ -194,16 +194,16 @@ class LineTimingGenerator(Elaboratable):
                 m.next = "ADDR"
 
             with m.State("ADDR"):
-                # address the row we want to apply the pixels to, while blanked
-                # to avoid ghosting from the previously addressed row.
-                m.d.sync += self.o_line_addr.eq(self.i_line_addr)
+                # select the row we want to apply the pixels to, while blanked,
+                # to avoid ghosting from the previously selected row.
+                m.d.sync += self.o_row_sel.eq(self.i_row_sel)
                 m.d.comb += self.o_blank.eq(1)
 
                 m.next = "LATCH"
 
             with m.State("LATCH"):
                 # latch in the new data to the row selected above, remaining
-                # blank so we don't show the old row's data briefly
+                # blank so we don't show the old row's data briefly.
                 m.d.comb += [
                     self.o_latch.eq(1),
                     self.o_blank.eq(1),
@@ -213,7 +213,7 @@ class LineTimingGenerator(Elaboratable):
 
             with m.State("UNBLANK"):
                 # finally, unblank the display so everyone can see the
-                # shiny new line.
+                # shiny new row.
                 # (it's unblanked now because we didn't specifcally blank it)
 
                 with m.If(self.i_idle == 1):
@@ -238,9 +238,10 @@ class FrameTimingGenerator(Elaboratable):
         self.i_rgb1 = Signal(3)
 
         # what pixel we are addressing
-        self.o_row = Signal(self.pd.row_bits)
-        self.o_col = Signal(self.pd.col_bits)
-        self.o_bit = Signal(self.pd.bit_bits)
+        self.o_col = Signal(self.pd.col_bits) # all the columns in the row
+        self.o_bit = Signal(self.pd.bit_bits) # all the bits in the row's pixels
+        self.o_row = Signal(self.pd.row_bits) # all the rows on the screen
+        
         # is this an even or an odd line? flipped after every line is finished,
         # used by the pixel reader.
         self.o_odd_line = Signal()
@@ -250,11 +251,12 @@ class FrameTimingGenerator(Elaboratable):
         self.o_rgb1 = Signal(3)
 
         self.ltg = LineTimingGenerator(self.pd)
-        # and all the line generator outputs
+        # forward all the line generator outputs so they can be attached to the
+        # display
         self.o_shift_active = self.ltg.o_shift_active
         self.o_latch = self.ltg.o_latch
         self.o_blank = self.ltg.o_blank
-        self.o_line_addr = self.ltg.o_line_addr
+        self.o_row_sel = self.ltg.o_row_sel
 
         self.col_ctr = UpCounter(self.pd.col_bits)
         self.bit_ctr = UpCounter(self.pd.bit_bits)
@@ -280,10 +282,10 @@ class FrameTimingGenerator(Elaboratable):
         m.submodules.line_times_ctr = line_times_ctr = self.line_times_ctr
 
         # there are always three pixels in motion. the address of the most
-        # recent pixel is output to o_row and o_col for whatever is calculating
-        # pixels. the next cycle, the pixel at i_rgbX is latched into disp_rgbX.
-        # the cycle after that, the pixel in disp_rgbX is output to the panel to
-        # be clocked in.
+        # recent pixel is output to o_col, o_bit and o_row for whatever is
+        # calculating pixels. the next cycle, the pixel at i_rgbX is latched
+        # into disp_rgbX. the cycle after that, the pixel in disp_rgbX is output
+        # to the panel to be clocked in.
 
         # thus every cycle there is a pixel being Addressed, a pixel being
         # Calculated, and a pixel being Displayed.
@@ -312,28 +314,28 @@ class FrameTimingGenerator(Elaboratable):
             self.o_row.eq(row_ctr.value),
         ]
 
-        # the position counters count columns, bits, then rows. we do the rows
-        # last because switching rows too fast causes ghosting.
+        # the position counters count columns, then bits, then rows. we do the
+        # rows last because switching rows too fast causes ghosting.
+
         # should the position counters be counting? the state machine says no if
         # we are waiting for the line to be displayed.
         should_count = Signal()
-        should_count_row = Signal()
+        next_row = Signal()
         m.d.comb += [
             col_ctr.enable.eq(should_count),
             # count bit when column counter expires
             bit_ctr.enable.eq(col_ctr.at_max & should_count),
-            # count row when bit reaches its maximum.
+            # count to the next row when bit reaches its maximum.
             # bpp might not be a power of 2, so we have to explicitly check
             # instead of waiting for rollover.
-            should_count_row.eq(
-                (bit_ctr.value == self.pd.bpp-1) & bit_ctr.enable),
-            row_ctr.enable.eq(should_count_row),
-            bit_ctr.reset.eq(should_count_row),
+            next_row.eq((bit_ctr.value == self.pd.bpp-1) & bit_ctr.enable),
+            row_ctr.enable.eq(next_row),
+            bit_ctr.reset.eq(next_row),
         ]
 
         # if we're counting a new row, then we have finished the current one and
         # should update if we are doing an odd row or not.
-        with m.If(should_count_row):
+        with m.If(next_row):
             m.d.sync += self.o_odd_line.eq(~self.o_odd_line)
 
         # the line time counter counts every time the line cycle counter
@@ -392,18 +394,18 @@ class FrameTimingGenerator(Elaboratable):
                 # don't idle the line generator
                 m.d.comb += should_idle.eq(0)
 
-                # are we addressing the last pixel?
+                # are we addressing the last pixel of the line?
                 with m.If(col_ctr.at_max):
                     # yes, tell the line generator what row it should update
                     # whenever it finishes
-                    m.d.sync += ltg.i_line_addr.eq(self.row_ctr.value)
+                    m.d.sync += ltg.i_row_sel.eq(self.row_ctr.value)
                     # and wait for this line to end
                     m.next = "WAIT"
                 with m.Else():
                     # keep on counting the pixels throughout the line
                     m.d.comb += should_count.eq(1)
                     # once we're finished, we don't count any more so we remain
-                    # on this line.
+                    # on this line until the next one starts.
 
             with m.State("WAIT"):
                 # have we finished with this brightness?
@@ -434,19 +436,20 @@ class PixelReader(Elaboratable):
         # glitchy.
         # two: we must only read each line from memory once. if we read it more
         # than once and it changes between reads, the display starts looking
-        # really funky because we are drawing one bitplane at a time and any
-        # changed pixels won't look like what they were before or after the
-        # change.
+        # really funky because we are drawing one bit at a time. if a bit gets
+        # changed, we might not catch it and then the pixel wouldn't look like
+        # it should have been before the change, or after, and would instead
+        # flash some random third color.
         # to do this, we have a RAM buffer that can buffer all pixel bits for 6
         # channels for two lines. thankfully, the frame generator doesn't need
-        # 6bits/cyc every cycle, so we do have enough time to read one pixel
-        # channel per cycle and fill up one half of the memory while we feed the
-        # other to the frame generator.
+        # 6bits/cyc every cycle, so we do have enough time to read one  channel
+        # per cycle and fill up one half of the memory while we feed the other
+        # to the frame generator.
 
         # pixel the frame generator wants to read.
-        self.i_row = Signal(self.pd.row_bits)
         self.i_col = Signal(self.pd.col_bits)
         self.i_bit = Signal(self.pd.bit_bits)
+        self.i_row = Signal(self.pd.row_bits)
         self.i_odd_line = Signal()
         # what color the 6 channels of that pixel are.
         self.o_pixel = Signal(6)
@@ -460,22 +463,22 @@ class PixelReader(Elaboratable):
         self.i_rdata = Signal(self.pd.bpp)
 
         # our buffer memory. it needs to be crazy wide so we can read 6 full
-        # pixels per cycle and select the 6 bits the frame generator wants.
+        # channels per cycle and select the 6 bits the frame generator wants.
         self.line_buf = Memory(width=6*self.pd.bpp, depth=2*self.pd.width)
 
-        # counter to index the pixels when reading. we generate the half select
-        # bit and channel bits elsewhere.
-        self.pix_ctr = UpCounter(self.pd.col_bits, init=0)
+        # counter to index the pixels in the column when reading.
+        self.col_ctr = UpCounter(self.pd.col_bits, init=0)
 
     def elaborate(self, platform):
         m = Module()
         # register submodules (and make a local reference without self)
         m.submodules.rdport = rdport = \
             self.line_buf.read_port(domain=self.led_domain, transparent=False)
-        # we want 6 enables so we can write 1 of 6 pixels
+        # we want each enable to cover one channel so we can write one channel
+        # at a time
         m.submodules.wrport = wrport = \
-            self.line_buf.write_port(granularity=6*self.pd.bpp//6)
-        m.submodules.pix_ctr = pix_ctr = self.pix_ctr
+            self.line_buf.write_port(granularity=self.pd.bpp)
+        m.submodules.col_ctr = col_ctr = self.col_ctr
 
         curr_rd_line_in = Signal(self.pd.row_bits)
         curr_rd_line_sync = FFSynchronizer(i=self.i_row, o=curr_rd_line_in,
@@ -501,7 +504,7 @@ class PixelReader(Elaboratable):
             rdport.addr.eq(Cat(self.i_col, fg_which_buf)),
             fg_data.eq(rdport.data),
         ]
-        # then we have to select the bits from the channels that the frame
+        # then we have to select the bits from the pixels that the frame
         # generator wants.
         with m.Switch(self.i_bit):
             for bn in range(self.pd.bpp): # which bit from the pixel
@@ -516,10 +519,10 @@ class PixelReader(Elaboratable):
         fg_wchan = Signal(3) # which channel we're writing. goes 0-5
         # combine into output address. channel bits, address bits, half bit
         m.d.comb += self.o_raddr.eq(
-            Cat(fg_rchan[:2], pix_ctr.value, curr_rd_line, fg_rchan[-1]))
+            Cat(fg_rchan[:2], col_ctr.value, curr_rd_line, fg_rchan[-1]))
         
         should_count = Signal() # should we count to the next pixel?
-        m.d.comb += self.pix_ctr.enable.eq(should_count)
+        m.d.comb += self.col_ctr.enable.eq(should_count)
         should_read = Signal() # are we intending to read a pixel?
         m.d.comb += self.o_re.eq(should_read)
         done_reading = Signal() # did the pixel read finish?
@@ -528,13 +531,13 @@ class PixelReader(Elaboratable):
         curr_which_buf = Signal() # which buffer we're currently reading
 
         # once the pixel read finishes, we want to write it to the buffer.
-        # we need to replicate the pixel across the 6 channels, then we only
-        # enable the channel we got back.
+        # we replicate the read channel data across the 6 memory channels, then
+        # only enable the write for the channel that the data is for.
         wr_data = Signal(self.pd.bpp)
         m.d.comb += wrport.data.eq(Repl(wr_data, 6))
         m.d.sync += [
             # at the address of the current pixel
-            wrport.addr.eq(Cat(pix_ctr.value, ~pr_which_buf)),
+            wrport.addr.eq(Cat(col_ctr.value, ~pr_which_buf)),
         ]
         m.d.comb += wr_data.eq(self.i_rdata),
         # enable the appropriate channel
@@ -552,7 +555,7 @@ class PixelReader(Elaboratable):
                     m.d.sync += curr_which_buf.eq(~curr_which_buf)
                     m.d.sync += curr_rd_line.eq(curr_rd_line_in+1)
                     # start at the first pixel
-                    m.d.comb += pix_ctr.reset.eq(1)
+                    m.d.comb += col_ctr.reset.eq(1)
                     # and get back into it
                     m.next = "P0R"
             with m.State("P0R"): # pixel 0's red channel
@@ -607,7 +610,7 @@ class PixelReader(Elaboratable):
                 ]
                 with m.If(done_reading): # have we got the data?
                     m.d.comb += should_count.eq(1)
-                    with m.If(pix_ctr.at_max): # done with this line?
+                    with m.If(col_ctr.at_max): # done with this line?
                         m.next = "WAIT"
                     with m.Else():
                         m.next = "P0R"                
@@ -738,16 +741,17 @@ class BufferedHUB75(Elaboratable):
 
         # we set the panel outputs synchronously so the panel doesn't see
         # glitches as things settle. this is done in the LED domain.
-        d = getattr(m.d, self.led_domain)
-        d += [
+        m.d[self.led_domain] += [
             hub75.latch.eq(ftg.o_latch),
             hub75.blank.eq(ftg.o_blank),
 
             Cat(hub75.r0, hub75.g0, hub75.b0).eq(ftg.o_rgb0),
             Cat(hub75.r1, hub75.g1, hub75.b1).eq(ftg.o_rgb1),
 
+            # jam together the row selection pins that go to the display
+            # and update them with the current row selection.
             Cat(getattr(hub75, "a"+str(n)) for n in range(5)).eq(
-                Cat(ftg.o_line_addr, 0))
+                Cat(ftg.o_row_sel, 0))
         ]
 
         # now we have to generate the panel shift clock.

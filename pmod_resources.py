@@ -25,7 +25,7 @@ hub75_pmod = [
         Subsignal("x1", Pins("10", dir="o", conn=("pmod", 0)),
             Attrs(IO_STANDARD="SB_LVCMOS33")),
         
-        # address selection pins (which row of the panel to drive)
+        # row selection pins (i.e. which row of the panel to drive)
         Subsignal("a0", Pins("1", dir="o", conn=("pmod", 1)),
             Attrs(IO_STANDARD="SB_LVCMOS33")),
         Subsignal("a1", Pins("2", dir="o", conn=("pmod", 1)),
