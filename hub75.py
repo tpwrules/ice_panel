@@ -428,11 +428,29 @@ class FrameTimingGenerator(Elaboratable):
 
 # read pixels from memory and serve them to the frame generator
 class PixelReader(Elaboratable):
-    def __init__(self, panel_desc, led_domain="sync"):
+    def __init__(self, panel_desc, led_domain="sync", gamma_params=None):
         self.pd = panel_desc
         # what domain the frame generator is in. we will still read pixels from
         # sync
         self.led_domain = led_domain
+
+        # generate appropriate gamma parameters if they weren't given
+        if gamma_params is not None and gamma_params.gamma is not None:
+            self.gp = gamma_params
+        else:
+            # we refer to gamma bpp everywhere, so set up parameters with gamma
+            # bpp equal to display bpp
+            self.gp = GammaParameters(gamma=None, bpp=self.pd.bpp)
+
+        if self.gp.gamma is not None:
+            # generate the gamma table from the given parameters
+            in_scale = 2**self.gp.bpp-1
+            out_scale = 2**self.pd.bpp-1
+            table = []
+            for x in range(2**self.gp.bpp):
+                table.append(int(((x/in_scale)**self.gp.gamma)*out_scale))
+            self.gamma_table = Memory(
+                width=self.pd.bpp, depth=2**self.gp.bpp, init=table)
 
         # so, we have two important requirements.
         # one: we must be able to deliver 6 pixel bits (one from each channel)
@@ -464,7 +482,7 @@ class PixelReader(Elaboratable):
         self.o_re = Signal()
         self.i_rack = Signal()
         self.o_raddr = Signal(self.pd.chan_bits)
-        self.i_rdata = Signal(self.pd.bpp)
+        self.i_rdata = Signal(self.gp.bpp)
 
         # our buffer memory. it needs to be crazy wide so we can read 6 full
         # channels per cycle and select the 6 bits the frame generator wants.
@@ -528,16 +546,42 @@ class PixelReader(Elaboratable):
         # once the pixel read finishes, we want to write it to the buffer.
         # we replicate the read channel data across the 6 memory channels, then
         # only enable the write for the channel that the data is for.
-        m.d.comb += wrport.data.eq(Repl(self.i_rdata, 6))
-        # and write it at the address of the current pixel, in the appropriate
-        # buffer half
-        m.d.sync += wrport.addr.eq(Cat(col_ctr.value, rd_row[0]))
-        # enable the appropriate channel for writing
-        for ch in range(6):
-            # we index channels from 0 to 5 here, but fg_rchan goes 0-2, 4-6
-            # because we skip 3 to keep addressing nice.
-            m.d.sync += wrport.en[ch].eq(
-                done_reading & (fg_rchan == (ch if ch < 3 else ch+1)))
+        # of course, if gamma is enabled, we pass the data through the gamma
+        # correction table before writing it.
+        if self.gp.gamma is None:
+            m.d.comb += wrport.data.eq(Repl(self.i_rdata, 6))
+            # write data at the address of the current pixel, in the appropriate
+            # buffer half
+            m.d.sync += wrport.addr.eq(Cat(col_ctr.value, rd_row[0]))
+            # enable the appropriate channel for writing
+            for ch in range(6):
+                # we index channels from 0 to 5 here, but fg_rchan goes 0-2, 4-6
+                # because we skip 3 to keep addressing nice.
+                m.d.sync += wrport.en[ch].eq(
+                    done_reading & (fg_rchan == (ch if ch < 3 else ch+1)))
+        else:
+            # the above, but through the gamma table
+            g_rdport = self.gamma_table.read_port()
+            m.submodules += g_rdport
+            m.d.comb += [
+                g_rdport.addr.eq(self.i_rdata),
+                wrport.data.eq(Repl(g_rdport.data, 6)),
+            ]
+            # buffer everything else an extra cycle to account for the table
+            g_waddr = Signal.like(wrport.addr)
+            g_done_reading = Signal.like(done_reading)
+            g_fg_rchan = Signal.like(fg_rchan)
+            m.d.sync += [
+                g_waddr.eq(Cat(col_ctr.value, rd_row[0])),
+                wrport.addr.eq(g_waddr),
+                g_done_reading.eq(done_reading),
+                g_fg_rchan.eq(fg_rchan),
+            ]
+            for ch in range(6):
+                # we index channels from 0 to 5 here, but fg_rchan goes 0-2, 4-6
+                # because we skip 3 to keep addressing nice.
+                m.d.sync += wrport.en[ch].eq(
+                    g_done_reading & (g_fg_rchan == (ch if ch < 3 else ch+1)))
         
         # FSM generates the channel addresses and manages starting/ending reads
         with m.FSM("WAIT"):
@@ -612,24 +656,7 @@ class PixelReader(Elaboratable):
 class BufferedHUB75(Elaboratable):
     def __init__(self, panel_desc, led_domain="sync", gamma_params=None):
         self.pd = panel_desc
-
-        # generate appropriate gamma parameters if they weren't given
-        if gamma_params is not None and gamma_params.gamma is not None:
-            self.gp = gamma_params
-        else:
-            # we refer to gamma bpp everywhere, so set up parameters with gamma
-            # bpp equal to display bpp
-            self.gp = GammaParameters(gamma=None, bpp=self.pd.bpp)
-
-        if self.gp.gamma is not None:
-            # generate the gamma table from the given parameters
-            in_scale = 2**self.gp.bpp-1
-            out_scale = 2**self.pd.bpp-1
-            table = []
-            for x in range(2**self.gp.bpp):
-                table.append(int(((x/in_scale)**self.gp.gamma)*out_scale))
-            self.gamma_table = Memory(
-                width=self.pd.bpp, depth=2**self.gp.bpp, init=table)
+        self.gp = gamma_params
 
         # what domain to run the LED engine in. framebuffers will still be
         # written to from sync.
@@ -656,7 +683,8 @@ class BufferedHUB75(Elaboratable):
         # read pixels and give them to the frame generator. we want it reading
         # from the LED domain too.
         self.pr = DomainRenamer(self.led_domain)(
-            PixelReader(self.pd, led_domain=self.led_domain))
+            PixelReader(self.pd, led_domain=self.led_domain,
+                gamma_params=self.gp))
 
         self.buf = Memory(width=self.pd.bpp, depth=2**self.pd.chan_bits)
 
@@ -677,35 +705,16 @@ class BufferedHUB75(Elaboratable):
         b_we = Signal.like(self.i_we)
         b_waddr = Signal.like(self.i_waddr)
         b_wdata = Signal.like(self.i_wdata)
-        # and once more, so we can gamma correct the data
-        g_we = Signal.like(self.i_we)
-        g_waddr = Signal.like(self.i_waddr)
-        g_wdata = Signal(self.pd.bpp)
         m.d.sync += [ # comes from memory write domain i.e. sync
             b_we.eq(self.i_we),
             b_waddr.eq(self.i_waddr),
             b_wdata.eq(self.i_wdata),
-            # gamma correction doesn't modify WE or address
-            g_we.eq(b_we),
-            g_waddr.eq(b_waddr),
         ]
 
-        if self.gp.gamma is None:
-            # just pass data through
-            m.d.sync += g_wdata.eq(b_wdata)
-        else:
-            # wire through gamma lookup table
-            g_rdport = self.gamma_table.read_port()
-            m.submodules += g_rdport
-            m.d.comb += [
-                g_rdport.addr.eq(b_wdata),
-                g_wdata.eq(g_rdport.data),
-            ]
-
         m.d.comb += [
-            wrport.addr.eq(g_waddr),
-            wrport.data.eq(g_wdata),
-            wrport.en.eq(g_we),
+            wrport.addr.eq(b_waddr),
+            wrport.data.eq(b_wdata),
+            wrport.en.eq(b_we),
 
             pr.i_row.eq(ftg.o_row),
             pr.i_col.eq(ftg.o_col),
@@ -717,7 +726,6 @@ class BufferedHUB75(Elaboratable):
         ]
 
         m.d[self.led_domain] += pr.i_rack.eq(pr.o_re)
-
 
         # we set the panel outputs synchronously so the panel doesn't see
         # glitches as things settle. this is done in the LED domain.
