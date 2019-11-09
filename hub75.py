@@ -232,10 +232,18 @@ class FrameTimingGenerator(Elaboratable):
     def __init__(self, panel_desc):
         self.pd = panel_desc
 
-        # the calculated pixel color. there's always just one bit per channel
-        # here; we tell the buffer what bit of the pixel we want now.
-        self.i_rgb0 = Signal(3)
-        self.i_rgb1 = Signal(3)
+        # there are always three pixels in motion. the address of the most
+        # recent pixel is output to o_col, o_bit and o_row for whatever is
+        # calculating pixels. the next cycle, the calculated pixel data in
+        # i_pixel is latched into disp_pixel. the cycle after that, the pixel in
+        # disp_pixel is output to the panel, so it can be clocked in.
+        # thus, every cycle there is a pixel being Addressed, a pixel being
+        # Calculated, and a pixel being Displayed.
+
+        # the calculated pixel data. there's always just one bit per channel
+        # here; we tell the buffer what bit of the pixel we'd like when we need
+        # it.
+        self.i_pixel = Signal(6)
 
         # what pixel we are addressing
         self.o_col = Signal(self.pd.col_bits) # all the columns in the row
@@ -246,9 +254,8 @@ class FrameTimingGenerator(Elaboratable):
         # used by the pixel reader.
         self.o_odd_line = Signal()
 
-        # non-buffered color out, synchronous with line timing generator
-        self.o_rgb0 = Signal(3)
-        self.o_rgb1 = Signal(3)
+        # non-buffered pixel data out, synchronous with line timing generator
+        self.o_pixel = Signal(6)
 
         self.ltg = LineTimingGenerator(self.pd)
         # forward all the line generator outputs so they can be attached to the
@@ -281,31 +288,14 @@ class FrameTimingGenerator(Elaboratable):
         m.submodules.line_cycle_ctr = line_cycle_ctr = self.line_cycle_ctr
         m.submodules.line_times_ctr = line_times_ctr = self.line_times_ctr
 
-        # there are always three pixels in motion. the address of the most
-        # recent pixel is output to o_col, o_bit and o_row for whatever is
-        # calculating pixels. the next cycle, the pixel at i_rgbX is latched
-        # into disp_rgbX. the cycle after that, the pixel in disp_rgbX is output
-        # to the panel to be clocked in.
-
-        # thus every cycle there is a pixel being Addressed, a pixel being
-        # Calculated, and a pixel being Displayed.
-
         m.d.comb += self.o_bit.eq(0)
 
-        # hold the currently displayed pixel
-        disp_rgb0 = Signal(3)
-        disp_rgb1 = Signal(3)
-
-        # latch the calculated pixel for display next cycle
-        m.d.sync += [
-            disp_rgb0.eq(self.i_rgb0),
-            disp_rgb1.eq(self.i_rgb1),
-        ]
-        # display the pixel in the display buffer
-        m.d.comb += [
-            self.o_rgb0.eq(disp_rgb0),
-            self.o_rgb1.eq(disp_rgb1),
-        ]
+        # pixel data currently being sent to the panel
+        disp_pixel = Signal(6)
+        # latch the calculated pixel for the panel next cycle
+        m.d.sync += disp_pixel.eq(self.i_pixel)
+        # send out the pixel in the buffer
+        m.d.comb += self.o_pixel.eq(disp_pixel),
 
         # address the pixel pointed to by the position counters
         m.d.comb += [
@@ -323,9 +313,9 @@ class FrameTimingGenerator(Elaboratable):
         next_row = Signal()
         m.d.comb += [
             col_ctr.enable.eq(should_count),
-            # count bit when column counter expires
+            # count bit counter when column counter expires
             bit_ctr.enable.eq(col_ctr.at_max & should_count),
-            # count to the next row when bit reaches its maximum.
+            # count to the next row when bit counter reaches its maximum.
             # bpp might not be a power of 2, so we have to explicitly check
             # instead of waiting for rollover.
             next_row.eq((bit_ctr.value == self.pd.bpp-1) & bit_ctr.enable),
@@ -451,12 +441,12 @@ class PixelReader(Elaboratable):
         self.i_bit = Signal(self.pd.bit_bits)
         self.i_row = Signal(self.pd.row_bits)
         self.i_odd_line = Signal()
-        # what color the 6 channels of that pixel are.
+        # and that pixel's data
         self.o_pixel = Signal(6)
 
-        # read master port to whatever memory has the pixels. we assert re when
-        # we want to read a pixel addressed by raddr. on the cycle that rack is
-        # asserted, we latch that pixel's data in from rdata.
+        # read master port to whatever memory has the pixel data. we assert re
+        # when we want to read a channel addressed by raddr. on the cycle that
+        # rack is asserted, we latch that channel's data in from rdata.
         self.o_re = Signal()
         self.i_rack = Signal()
         self.o_raddr = Signal(self.pd.chan_bits)
@@ -729,7 +719,7 @@ class BufferedHUB75(Elaboratable):
             pr.i_row.eq(ftg.o_row),
             pr.i_col.eq(ftg.o_col),
             pr.i_bit.eq(ftg.o_bit),
-            Cat(ftg.i_rgb0, ftg.i_rgb1).eq(pr.o_pixel),
+            ftg.i_pixel.eq(pr.o_pixel),
 
             rdport.addr.eq(pr.o_raddr),
             pr.i_rdata.eq(rdport.data),
@@ -745,8 +735,8 @@ class BufferedHUB75(Elaboratable):
             hub75.latch.eq(ftg.o_latch),
             hub75.blank.eq(ftg.o_blank),
 
-            Cat(hub75.r0, hub75.g0, hub75.b0).eq(ftg.o_rgb0),
-            Cat(hub75.r1, hub75.g1, hub75.b1).eq(ftg.o_rgb1),
+            Cat(hub75.r0, hub75.g0, hub75.b0,
+                hub75.r1, hub75.g1, hub75.b1).eq(ftg.o_pixel),
 
             # jam together the row selection pins that go to the display
             # and update them with the current row selection.
