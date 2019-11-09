@@ -1,7 +1,7 @@
 from nmigen import *
 from nmigen_boards.icebreaker import *
 import pmod_resources
-from hub75 import BufferedHUB75
+from hub75 import PanelDescription, BufferedHUB75
 from pll import PLL
 
 # boneless CPU architecture stuff
@@ -10,19 +10,16 @@ from boneless.arch.opcode import Instr
 from boneless.arch.opcode import *
 
 class BonelessLED(Elaboratable):
-    def __init__(self, panel_shape, led_domain="sync"):
-        # panel shape: physical (width, height) in LEDs
-        # i.e. width is how many pixels to shift out per row
-        # and height is 2**(addr_bits)/2 (assuming two rows are driven at once)
-        self.panel_shape = panel_shape
+    def __init__(self, panel_desc, led_domain="sync"):
+        self.pd = panel_desc
 
-        self.bpp = 8
+        self.gamma_bpp = 8
 
-        self.panel = BufferedHUB75(panel_shape, led_domain=led_domain,
-            bpp=self.bpp, gamma=2.5, gamma_bpp=10)
+        self.panel = BufferedHUB75(self.pd, led_domain=led_domain,
+            gamma=2.5, gamma_bpp=self.gamma_bpp)
 
         self.cpu_rom = Memory(width=16, depth=256,
-            init=Instr.assemble(firmware(self.bpp)))
+            init=Instr.assemble(firmware(self.gamma_bpp)))
         self.cpu_core = CoreFSM(alsru_cls=ALSRU_4LUT, memory=self.cpu_rom)
 
     def elaborate(self, platform):
@@ -35,8 +32,8 @@ class BonelessLED(Elaboratable):
         # hook up the CPU's external bus to the panel engine
         m.d.sync += [
             panel.i_we.eq(cpu_core.o_ext_we),
-            panel.i_waddr.eq(cpu_core.o_bus_addr[:panel.addr_bits]),
-            panel.i_wdata.eq(cpu_core.o_ext_data[:self.bpp])
+            panel.i_waddr.eq(cpu_core.o_bus_addr[:self.pd.chan_bits]),
+            panel.i_wdata.eq(cpu_core.o_ext_data[:self.gamma_bpp])
         ]
 
         return m
@@ -170,8 +167,8 @@ def firmware(bpp):
 
 # super top domain to manage clock stuff
 class Top(Elaboratable):
-    def __init__(self, panel_shape, led_freq_mhz=12):
-        self.panel_shape = panel_shape
+    def __init__(self, panel_desc, led_freq_mhz=12):
+        self.pd = panel_desc
         self.led_freq_mhz = led_freq_mhz
 
     def elaborate(self, platform):
@@ -198,7 +195,7 @@ class Top(Elaboratable):
 
         # create the actual demo and tell it to run in the domain we made
         # for it above
-        boneless_led = BonelessLED(self.panel_shape, led_domain=led_domain)
+        boneless_led = BonelessLED(self.pd, led_domain=led_domain)
 
         # remap the default sync domain to the CPU domain, since most logic
         # should run there.
@@ -208,13 +205,14 @@ class Top(Elaboratable):
 
         return m
 
+panel_desc = PanelDescription(width=32, height=16, bpp=10)
 
 if __name__ == "__main__":
-    design = Top(panel_shape=(32, 16), led_freq_mhz=40)
+    design = Top(panel_desc=panel_desc, led_freq_mhz=40)
     ICEBreakerPlatform().build(design, do_program=True, synth_opts="-abc9")
 
 # if __name__ == "__main__":
 #     from nmigen.cli import main
-#     design = Top(panel_shape=(32, 16), led_freq_mhz=12)
+#     design = Top(panel_desc=panel_desc, led_freq_mhz=12)
 #     main(design, platform=ICEBreakerPlatform(),
 #         ports=[v for k, v in design.__dict__.items() if k.startswith("p_") ])

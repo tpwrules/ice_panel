@@ -1,13 +1,100 @@
-# modules related to driving a HUB75 connector display.
-# we refer a lot to panel_shape: physical (width, height) in LEDs
-# i.e. width is how many pixels to shift out per row
-# and height is 2**(addr_bits)/2 (because two rows are driven at once)
-#
-# we basically always assume one pixel/address/etc is actually two, one for
-# RGB0 and the other for RGB1. except for in the buffered addresses!
-
 from nmigen import *
 from nmigen.lib.cdc import FFSynchronizer
+from collections import namedtuple
+
+# A HUB75 display (or chain of displays) is driven somewhat strangely.
+
+# Physically, it's 'width' RGB pixels wide by 'height' RGB pixels high.
+# Logically, it's still 'width' pixels wide, but is only 'height//2' pixels
+# high. The top half and bottom half of the display are driven simultaneously.
+# If you had a 16 high display, rows 0 and 8 would both be driven at the same
+# time, then 1 and 9, etc.
+
+# The display has no concept of PWM or brightness levels, or even buffering. The
+# whole display is drawn by switching rows really fast, and brightness is
+# created by refreshing each row really, really fast.
+
+# Fortunately, the display does know about color. The display takes 6 channels:
+# R, G, and B on/off for the selected row in the top half, then R, G, B on/off
+# for the same row in the bottom half, for 6 bits of information per output
+# pixel. Because of this, whenever we refer to a "pixel" when driving, we mean
+# the three colors of one physical pixel in the top half plus the three colors
+# of the corresponding physical pixel in the bottom half. Each color may have a
+# number of bits, depending on the selected 'bpp', but the display only sees one
+# bit at a time. Similarly, we say there are 6 channels per pixel. To
+# disambiguate, we say "physical pixel/channel/row" when referring to an item
+# that's actually on the display panel, and just "pixel/channel/row" when
+# referring to a top/bottom pair of items.
+
+# To draw the screen, we start by selecting row 0, then sending out bit 0 of the
+# 'width' pixels on that row. We wait for 'n' time for it to display, then send
+# out bit 1 of the same pixels, then wait time '2n', then send out bit 2, then
+# wait time '4n', etc. In this way, the total amount of light output by each LED
+# is proportional to the value of the pixel, and we only have to refresh the row
+# 'bpp' times instead of 2**'bpp' times. Once all the bits have been seen, we
+# switch to row 1 and do it again. Once all the rows have been displayed, we
+# switch back to row 0 and start all over.
+
+# Unfortunately, proportional to the value is a bad metric, and leads to too few
+# brightness levels on the low end and too many on the high end. We offer the
+# option to gamma correct the pixels before displaying them to alleviate this.
+
+_pd_fields = [
+    # USER CONFIGURABLE PARAMETERS
+    'width', # width of the display, in physical pixels
+    'height', # height of the display, in physical pixels
+    'bpp', # number of bits per color per pixel. e.g. 8 would be 24-bit RGB.
+
+    # CALCULATED PARAMETERS
+    'bit_bits', # no. bits reqd. to select a bit in a pixel, 0 to bpp-1
+    'col_bits', # no. bits reqd. to select a column, 0 to (width-1)
+    'row_bits', # no. bits reqd. to select a row, 0 to (height//2-1)
+    'pix_bits', # no. bits reqd. to select a pixel, col_bits+row_bits
+    'chan_bits', # no. bits reqd. to select a physical channel of a physical
+                 # pixel. pix_bits+3, 1 to select display half, 2 to select
+                 # R, G, B or (unused). indexes e.g. framebuffer memory.
+]
+
+class PanelDescription(namedtuple("PanelDescription", _pd_fields)):
+    def __new__(cls, width, height, bpp):
+        # make sure BPP sounds legit. we'll overbudget our memories if 
+        # it's > 16, and there would never be enough time to refresh it anyway.
+        # note also that very low BPP will probably break since the line reader
+        # won't have enough time to read in new lines and the display would look
+        # ghosty as crap since rows are being switched way too fast.
+        # TODO: detect above situation and add appropriate delay?
+        if bpp < 1:
+            raise ValueError(
+                "who would even have a {}-level display?".format(2**bpp))
+        elif bpp > 16:
+            raise ValueError("{}bpp? now that's just greedy".format(bpp))
+        # all our counters assume width and height are a power of 2, and AFAIK
+        # you can't buy the panels in non power of 2 sizes anyway.
+        if width <= 0 or (width & (width-1)) != 0:
+            raise ValueError(
+                "width must be a positive power of 2,"
+                "which doesn't include {}!".format(width))
+        # height has to be at least 2 so we can split it into half displays.
+        if height <= 1 or (height & (height-1)) != 0:
+            raise ValueError(
+                "height must be at least 2 and a power of 2,"
+                "which doesn't include {}!".format(height))
+
+        # calculate the calculated parameters from the ones the user gave us
+        bit_bits = (bpp-1).bit_length()
+        col_bits = (width-1).bit_length()
+        row_bits = (height//2-1).bit_length()
+        pix_bits = col_bits+row_bits
+        chan_bits = pix_bits+1+2
+
+        return super(PanelDescription, cls).__new__(cls,
+            width, height, bpp,
+            bit_bits, col_bits, row_bits,
+            pix_bits, chan_bits,
+        )
+
+del _pd_fields # not needed in the future
+
 
 class UpCounter(Elaboratable):
     def __init__(self, width, init=0):
@@ -47,15 +134,15 @@ class UpCounter(Elaboratable):
 
 # generate the line timing and signals for the display
 class LineTimingGenerator(Elaboratable):
-    def __init__(self, panel_shape):
-        self.panel_shape = panel_shape
+    def __init__(self, panel_desc):
+        self.pd = panel_desc
 
         # idle input. if asserted when the generator finishes a line,
         # the generator will not start on the next line until deasserted. blank
         # is not asserted during idle.
         self.i_idle = Signal()
         # which line is being displayed. latched at the end of the line or so
-        self.i_line_addr = Signal((panel_shape[1]//2-1).bit_length())
+        self.i_line_addr = Signal(self.pd.row_bits)
 
         # shift active output. asserted when actively shifting pixels (and thus
         # the panel should receive the shift clock)
@@ -68,7 +155,7 @@ class LineTimingGenerator(Elaboratable):
         self.o_line_addr = Signal.like(self.i_line_addr)
 
         # current pixel output
-        self.pixel_ctr = UpCounter((panel_shape[0]-1).bit_length(), init=0)
+        self.pixel_ctr = UpCounter(self.pd.col_bits, init=0)
 
     def elaborate(self, platform):
         m = Module()
@@ -142,25 +229,18 @@ class LineTimingGenerator(Elaboratable):
 
 # keep track of where we are in the overall display
 class FrameTimingGenerator(Elaboratable):
-    def __init__(self, panel_shape, bpp=1):
-        self.panel_shape = panel_shape
-        # bits per color per pixel. determines modulation steps
-        self.bpp = bpp
+    def __init__(self, panel_desc):
+        self.pd = panel_desc
 
         # the calculated pixel color. there's always just one bit per channel
         # here; we tell the buffer what bit of the pixel we want now.
         self.i_rgb0 = Signal(3)
         self.i_rgb1 = Signal(3)
 
-        self.row_bits = (panel_shape[1]//2-1).bit_length()
-        # index the bit of the pixel
-        self.bit_bits = (bpp-1).bit_length()
-        self.col_bits = (panel_shape[0]-1).bit_length()
-
         # what pixel we are addressing
-        self.o_row = Signal(self.row_bits)
-        self.o_col = Signal(self.col_bits)
-        self.o_bit = Signal(self.bit_bits)
+        self.o_row = Signal(self.pd.row_bits)
+        self.o_col = Signal(self.pd.col_bits)
+        self.o_bit = Signal(self.pd.bit_bits)
         # is this an even or an odd line? flipped after every line is finished,
         # used by the pixel reader.
         self.o_odd_line = Signal()
@@ -169,25 +249,25 @@ class FrameTimingGenerator(Elaboratable):
         self.o_rgb0 = Signal(3)
         self.o_rgb1 = Signal(3)
 
-        self.ltg = LineTimingGenerator(panel_shape)
+        self.ltg = LineTimingGenerator(self.pd)
         # and all the line generator outputs
         self.o_shift_active = self.ltg.o_shift_active
         self.o_latch = self.ltg.o_latch
         self.o_blank = self.ltg.o_blank
         self.o_line_addr = self.ltg.o_line_addr
 
-        self.col_ctr = UpCounter(self.col_bits)
-        self.bit_ctr = UpCounter(self.bit_bits)
-        self.row_ctr = UpCounter(self.row_bits)
+        self.col_ctr = UpCounter(self.pd.col_bits)
+        self.bit_ctr = UpCounter(self.pd.bit_bits)
+        self.row_ctr = UpCounter(self.pd.row_bits)
 
         # brightness control. split into two counters so we can have the actual
         # line take a non-power-of-two time.
         # count number of cycles in the line. line generator takes 4 cycles
         # between lines to switch.
-        self.num_line_cycles = panel_shape[0]+4
+        self.num_line_cycles = self.pd.width+4
         self.line_cycle_ctr = UpCounter((self.num_line_cycles-1).bit_length())
         # then number of line times so we can keep track of brightness
-        self.line_times_ctr = UpCounter(self.bpp)
+        self.line_times_ctr = UpCounter(self.pd.bpp)
 
     def elaborate(self, platform):
         m = Module()
@@ -245,7 +325,8 @@ class FrameTimingGenerator(Elaboratable):
             # count row when bit reaches its maximum.
             # bpp might not be a power of 2, so we have to explicitly check
             # instead of waiting for rollover.
-            should_count_row.eq((bit_ctr.value == self.bpp-1) & bit_ctr.enable),
+            should_count_row.eq(
+                (bit_ctr.value == self.pd.bpp-1) & bit_ctr.enable),
             row_ctr.enable.eq(should_count_row),
             bit_ctr.reset.eq(should_count_row),
         ]
@@ -269,7 +350,7 @@ class FrameTimingGenerator(Elaboratable):
         # rotate a bitmask to select the appropriate bit of the line counter. of
         # course, if this mask were to get out of sync with the bit counter,
         # the brightnesses would be all wrong. fortunately, that's not possible.
-        line_time_delay = Signal(self.bpp, reset=1)
+        line_time_delay = Signal(self.pd.bpp, reset=1)
 
         should_idle = Signal() # should the line generator be idling?
         m.d.comb += ltg.i_idle.eq(should_idle)
@@ -341,21 +422,11 @@ class FrameTimingGenerator(Elaboratable):
 
 # read pixels from memory and serve them to the frame generator
 class PixelReader(Elaboratable):
-    def __init__(self, panel_shape, bpp=1, led_domain="sync"):
-        self.panel_shape = panel_shape
-        self.bpp = bpp # number of bits per pixel
+    def __init__(self, panel_desc, led_domain="sync"):
+        self.pd = panel_desc
         # what domain the frame generator is in. we will still read pixels from
         # sync
         self.led_domain = led_domain
-
-        # calculate address widths
-        self.row_bits = (panel_shape[1]//2-1).bit_length()
-        self.col_bits = (panel_shape[0]-1).bit_length()
-        self.bit_bits = (bpp-1).bit_length()
-        self.pixel_bits = self.col_bits
-        # + 1 because each address above refers to two indepdendent pixels,
-        # + 2 to select pixel color channel
-        self.addr_bits = self.pixel_bits + 1 + 2
 
         # so, we have two important requirements.
         # one: we must be able to deliver 6 pixel bits (one from each channel)
@@ -373,9 +444,9 @@ class PixelReader(Elaboratable):
         # other to the frame generator.
 
         # pixel the frame generator wants to read.
-        self.i_row = Signal(self.row_bits)
-        self.i_col = Signal(self.col_bits)
-        self.i_bit = Signal(self.bit_bits)
+        self.i_row = Signal(self.pd.row_bits)
+        self.i_col = Signal(self.pd.col_bits)
+        self.i_bit = Signal(self.pd.bit_bits)
         self.i_odd_line = Signal()
         # what color the 6 channels of that pixel are.
         self.o_pixel = Signal(6)
@@ -385,16 +456,16 @@ class PixelReader(Elaboratable):
         # asserted, we latch that pixel's data in from rdata.
         self.o_re = Signal()
         self.i_rack = Signal()
-        self.o_raddr = Signal(self.addr_bits + self.row_bits)
-        self.i_rdata = Signal(self.bpp)
+        self.o_raddr = Signal(self.pd.chan_bits)
+        self.i_rdata = Signal(self.pd.bpp)
 
         # our buffer memory. it needs to be crazy wide so we can read 6 full
         # pixels per cycle and select the 6 bits the frame generator wants.
-        self.line_buf = Memory(width=6*self.bpp, depth=2*self.panel_shape[0])
+        self.line_buf = Memory(width=6*self.pd.bpp, depth=2*self.pd.width)
 
         # counter to index the pixels when reading. we generate the half select
         # bit and channel bits elsewhere.
-        self.pix_ctr = UpCounter(self.pixel_bits, init=0)
+        self.pix_ctr = UpCounter(self.pd.col_bits, init=0)
 
     def elaborate(self, platform):
         m = Module()
@@ -403,14 +474,14 @@ class PixelReader(Elaboratable):
             self.line_buf.read_port(domain=self.led_domain, transparent=False)
         # we want 6 enables so we can write 1 of 6 pixels
         m.submodules.wrport = wrport = \
-            self.line_buf.write_port(granularity=6*self.bpp//6)
+            self.line_buf.write_port(granularity=6*self.pd.bpp//6)
         m.submodules.pix_ctr = pix_ctr = self.pix_ctr
 
-        curr_rd_line_in = Signal(self.row_bits)
+        curr_rd_line_in = Signal(self.pd.row_bits)
         curr_rd_line_sync = FFSynchronizer(i=self.i_row, o=curr_rd_line_in,
             o_domain="sync", reset_less=False, stages=3)
         m.submodules += curr_rd_line_sync
-        curr_rd_line = Signal(self.row_bits)
+        curr_rd_line = Signal(self.pd.row_bits)
 
         # zeroth, we need to know what buffer we are on. the frame generator
         # controls that in its domain, so we need to sync it to the domain we're
@@ -424,7 +495,7 @@ class PixelReader(Elaboratable):
         m.submodules.which_buf_sync = which_buf_sync
 
         # first, the pixels being read by the frame generator.
-        fg_data = Signal(6*self.bpp)
+        fg_data = Signal(6*self.pd.bpp)
         m.d.comb += [
             # get read directly from the buffer
             rdport.addr.eq(Cat(self.i_col, fg_which_buf)),
@@ -433,11 +504,11 @@ class PixelReader(Elaboratable):
         # then we have to select the bits from the channels that the frame
         # generator wants.
         with m.Switch(self.i_bit):
-            for bn in range(self.bpp): # which bit from the pixel
+            for bn in range(self.pd.bpp): # which bit from the pixel
                 with m.Case(bn):
                     for cn in range(6): # which pixel channel
                         m.d.comb += self.o_pixel[cn].eq(
-                            fg_data[cn*self.bpp+bn])
+                            fg_data[cn*self.pd.bpp+bn])
 
         # second, state machine to read pixels to fill the buffer.
         # it tells us the read and write channels below.
@@ -459,7 +530,7 @@ class PixelReader(Elaboratable):
         # once the pixel read finishes, we want to write it to the buffer.
         # we need to replicate the pixel across the 6 channels, then we only
         # enable the channel we got back.
-        wr_data = Signal(self.bpp)
+        wr_data = Signal(self.pd.bpp)
         m.d.comb += wrport.data.eq(Repl(wr_data, 6))
         m.d.sync += [
             # at the address of the current pixel
@@ -546,48 +617,39 @@ class PixelReader(Elaboratable):
 
 # a whole screen and buffer
 class BufferedHUB75(Elaboratable):
-    def __init__(self, panel_shape, led_domain="sync", bpp=1,
+    def __init__(self, panel_desc, led_domain="sync",
             gamma=None, gamma_bpp=None):
-        self.panel_shape = panel_shape
+        self.pd = panel_desc
+
         # gamma correction.
         # gamma is the exponent of the gamma curve, or None to disable.
-        # if gamma is enabled, bpp bits look up a gamma_bpp wide table.
-        # if gamma_bpp is none, gamma_bpp = bpp
+        # if gamma is enabled, gamma_bpp bits look up a pd.bpp wide table.
+        # if gamma_bpp is none, gamma_bpp = pd.bpp
         self.gamma = gamma
-        self.bpp = bpp # number of bits per color per pixel
         if gamma is not None and gamma_bpp is not None:
             self.gamma_bpp = gamma_bpp
         else:
-            self.gamma_bpp = bpp
+            self.gamma_bpp = self.pd.bpp
 
-        if self.bpp < 1 or self.gamma_bpp < 1:
-            raise Exception(
+        if self.gamma_bpp < 1:
+            raise ValueError(
                 "who would even have a {}-color display?".format(
-                    min(2**self.bpp, 2**self.gamma_bpp)))
-        elif self.bpp > 16 or self.gamma_bpp > 16:
-            raise Exception("{}bpp? now that's just greedy".format(
-                max(self.bpp, self.gamma_bpp)))
+                    2**self.gamma_bpp))
+        # gamma_bpp can be as high as the user wants, though it would be dumb
 
         if self.gamma is not None:
             # generate the gamma table from the given parameters
-            in_scale = 2**self.bpp-1
-            out_scale = 2**self.gamma_bpp-1
+            in_scale = 2**self.gamma_bpp-1
+            out_scale = 2**self.pd.bpp-1
             table = []
-            for x in range(2**self.bpp):
+            for x in range(2**self.gamma_bpp):
                 table.append(int(((x/in_scale)**self.gamma)*out_scale))
             self.gamma_table = Memory(
-                width=self.gamma_bpp, depth=2**self.bpp, init=table)
+                width=self.pd.bpp, depth=2**self.gamma_bpp, init=table)
 
         # what domain to run the LED engine in. framebuffers will still be
         # written to from sync.
         self.led_domain = led_domain
-        # calculate how wide the address components are
-        self.row_bits = (self.panel_shape[1]//2-1).bit_length()
-        self.col_bits = (self.panel_shape[0]-1).bit_length()
-        self.pixel_bits = self.row_bits + self.col_bits
-        # + 1 because each address above refers to two indepdendent pixels,
-        # + 2 to select pixel color channel
-        self.addr_bits = self.pixel_bits + 1 + 2
 
         # framebuffer write inputs.
         # the low 2 bits of the address select R, G, B, or nothing.
@@ -597,24 +659,22 @@ class BufferedHUB75(Elaboratable):
         # this means the display is linearly addressed R, G, B color, left to
         # right, top to bottom
         self.i_we = Signal()
-        self.i_waddr = Signal(self.addr_bits)
-        self.i_wdata = Signal(self.bpp)
+        self.i_waddr = Signal(self.pd.chan_bits)
+        self.i_wdata = Signal(self.gamma_bpp)
 
         # our only output is to the display, which we grab direct from the
         # platform during elaboration
 
         # and have a mechanism to actually generate the display
         # (display generation happens in the LED clock domain)
-        self.ftg = DomainRenamer(self.led_domain)(
-            FrameTimingGenerator(panel_shape, bpp=self.gamma_bpp))
+        self.ftg = DomainRenamer(self.led_domain)(FrameTimingGenerator(self.pd))
 
         # read pixels and give them to the frame generator. we want it reading
         # from the LED domain too.
         self.pr = DomainRenamer(self.led_domain)(
-            PixelReader(panel_shape, bpp=self.gamma_bpp,
-                led_domain=self.led_domain))
+            PixelReader(self.pd, led_domain=self.led_domain))
 
-        self.buf = Memory(width=self.gamma_bpp, depth=2**self.addr_bits)
+        self.buf = Memory(width=self.pd.bpp, depth=2**self.pd.chan_bits)
 
     def elaborate(self, platform):
         # get the display from the platform.
@@ -636,7 +696,7 @@ class BufferedHUB75(Elaboratable):
         # and once more, so we can gamma correct the data
         g_we = Signal.like(self.i_we)
         g_waddr = Signal.like(self.i_waddr)
-        g_wdata = Signal(self.gamma_bpp)
+        g_wdata = Signal(self.pd.bpp)
         m.d.sync += [ # comes from memory write domain i.e. sync
             b_we.eq(self.i_we),
             b_waddr.eq(self.i_waddr),
