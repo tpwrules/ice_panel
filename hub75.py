@@ -358,11 +358,12 @@ class FrameTimingGenerator(Elaboratable):
 
 # read pixels from memory and serve them to the frame generator
 class PixelReader(Elaboratable):
-    def __init__(self, panel_shape, bpp=1, in_domain="sync", out_domain="led"):
+    def __init__(self, panel_shape, bpp=1, led_domain="sync"):
         self.panel_shape = panel_shape
         self.bpp = bpp # number of bits per pixel
-        self.in_domain = in_domain
-        self.out_domain = out_domain
+        # what domain the frame generator is in. we will still read pixels from
+        # sync
+        self.led_domain = led_domain
 
         # calculate address widths
         self.row_bits = (panel_shape[1]//2-1).bit_length()
@@ -417,18 +418,15 @@ class PixelReader(Elaboratable):
         m = Module()
         # register submodules (and make a local reference without self)
         m.submodules.rdport = rdport = \
-            self.line_buf.read_port(domain=self.out_domain, transparent=False)
+            self.line_buf.read_port(domain=self.led_domain, transparent=False)
         # we want 6 enables so we can write 1 of 6 pixels
         m.submodules.wrport = wrport = \
-            self.line_buf.write_port(domain=self.in_domain,
-                granularity=6*self.bpp//6)
-        m.submodules.pix_ctr = pix_ctr = \
-            DomainRenamer(self.in_domain)(self.pix_ctr)
-
+            self.line_buf.write_port(granularity=6*self.bpp//6)
+        m.submodules.pix_ctr = pix_ctr = self.pix_ctr
 
         curr_rd_line_in = Signal(self.row_bits)
         curr_rd_line_sync = FFSynchronizer(i=self.i_row, o=curr_rd_line_in,
-            o_domain=self.in_domain, reset_less=False, stages=3)
+            o_domain="sync", reset_less=False, stages=3)
         m.submodules += curr_rd_line_sync
         curr_rd_line = Signal(self.row_bits)
         #m.d.comb += curr_rd_line.eq(3)
@@ -441,7 +439,7 @@ class PixelReader(Elaboratable):
         m.d.comb += fg_which_buf.eq(self.i_odd_line)
         pr_which_buf = Signal()
         which_buf_sync = FFSynchronizer(i=fg_which_buf, o=pr_which_buf,
-            o_domain=self.in_domain, reset_less=False, stages=3)
+            o_domain="sync", reset_less=False, stages=3)
         m.submodules.which_buf_sync = which_buf_sync
 
         # first, the pixels being read by the frame generator.
@@ -482,25 +480,25 @@ class PixelReader(Elaboratable):
         # enable the channel we got back.
         wr_data = Signal(self.bpp)
         m.d.comb += wrport.data.eq(Repl(wr_data, 6))
-        m.d[self.in_domain] += [
+        m.d.sync += [
             # at the address of the current pixel
             wrport.addr.eq(Cat(pix_ctr.value, ~pr_which_buf)),
         ]
         m.d.comb += wr_data.eq(self.i_rdata),
         # enable the appropriate channel
         for ch in range(6):
-            m.d[self.in_domain] += wrport.en[ch].eq(
+            m.d.sync += wrport.en[ch].eq(
                 done_reading & (fg_wchan == ch))
         
         # choose which channels to read
         
-        with m.FSM("WAIT", domain=self.in_domain):
+        with m.FSM("WAIT"):
             with m.State("WAIT"): # wait for next line to begin
                 # i.e. the frame generator is reading the line we are working on
                 with m.If(pr_which_buf == curr_which_buf):
                     # swap buffers
-                    m.d[self.in_domain] += curr_which_buf.eq(~curr_which_buf)
-                    m.d[self.in_domain] += curr_rd_line.eq(curr_rd_line_in+1)
+                    m.d.sync += curr_which_buf.eq(~curr_which_buf)
+                    m.d.sync += curr_rd_line.eq(curr_rd_line_in+1)
                     # start at the first pixel
                     m.d.comb += pix_ctr.reset.eq(1)
                     # and get back into it
@@ -629,9 +627,11 @@ class BufferedHUB75(Elaboratable):
         self.ftg = DomainRenamer(self.led_domain)(
             FrameTimingGenerator(panel_shape, bpp=self.gamma_bpp))
 
-        # read pixels and give them to the frame generator
-        self.pr = PixelReader(panel_shape, bpp=self.gamma_bpp,
-            in_domain=self.led_domain, out_domain=self.led_domain)
+        # read pixels and give them to the frame generator. we want it reading
+        # from the LED domain too.
+        self.pr = DomainRenamer(self.led_domain)(
+            PixelReader(panel_shape, bpp=self.gamma_bpp,
+                led_domain=self.led_domain))
 
         self.buf = Memory(width=self.gamma_bpp, depth=2**self.addr_bits)
 
