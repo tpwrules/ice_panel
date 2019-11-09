@@ -96,6 +96,28 @@ class PanelDescription(namedtuple("PanelDescription", _pd_fields)):
 
 del _pd_fields # not needed in the future
 
+_gp_fields = [
+    'gamma', # exponent of the gamma curve. can be None to disable correction
+    'bpp', # bpp of channel before gamma correction.
+    # you might try gamma=2.5 and bpp=display bpp-2
+]
+class GammaParameters(namedtuple("GammaParameters", _gp_fields)):
+    def __new__(cls, gamma, bpp):
+        # check for legit BPP. in theory, it can be as high as the user wants,
+        # if their framebuffer memory is wide enough. but having gamma bpp be
+        # higher than display bpp is silly.
+        if bpp < 1:
+            raise ValueError(
+                "who would even have a {}-level display?".format(2**bpp))
+        if gamma is not None and gamma <= 1:
+            raise ValueError(
+                "gamma correction should be > 1 to do anything useful,"
+                "which {} isn't.".format(gamma))
+
+        return super(GammaParameters, cls).__new__(cls, gamma, bpp)
+
+del _gp_fields # not needed in the future
+
 
 class UpCounter(Elaboratable):
     def __init__(self, width, init=0):
@@ -588,35 +610,26 @@ class PixelReader(Elaboratable):
 
 # a whole screen and buffer
 class BufferedHUB75(Elaboratable):
-    def __init__(self, panel_desc, led_domain="sync",
-            gamma=None, gamma_bpp=None):
+    def __init__(self, panel_desc, led_domain="sync", gamma_params=None):
         self.pd = panel_desc
 
-        # gamma correction.
-        # gamma is the exponent of the gamma curve, or None to disable.
-        # if gamma is enabled, gamma_bpp bits look up a pd.bpp wide table.
-        # if gamma_bpp is none, gamma_bpp = pd.bpp
-        self.gamma = gamma
-        if gamma is not None and gamma_bpp is not None:
-            self.gamma_bpp = gamma_bpp
+        # generate appropriate gamma parameters if they weren't given
+        if gamma_params is not None and gamma_params.gamma is not None:
+            self.gp = gamma_params
         else:
-            self.gamma_bpp = self.pd.bpp
+            # we refer to gamma bpp everywhere, so set up parameters with gamma
+            # bpp equal to display bpp
+            self.gp = GammaParameters(gamma=None, bpp=self.pd.bpp)
 
-        if self.gamma_bpp < 1:
-            raise ValueError(
-                "who would even have a {}-color display?".format(
-                    2**self.gamma_bpp))
-        # gamma_bpp can be as high as the user wants, though it would be dumb
-
-        if self.gamma is not None:
+        if self.gp.gamma is not None:
             # generate the gamma table from the given parameters
-            in_scale = 2**self.gamma_bpp-1
+            in_scale = 2**self.gp.bpp-1
             out_scale = 2**self.pd.bpp-1
             table = []
-            for x in range(2**self.gamma_bpp):
-                table.append(int(((x/in_scale)**self.gamma)*out_scale))
+            for x in range(2**self.gp.bpp):
+                table.append(int(((x/in_scale)**self.gp.gamma)*out_scale))
             self.gamma_table = Memory(
-                width=self.pd.bpp, depth=2**self.gamma_bpp, init=table)
+                width=self.pd.bpp, depth=2**self.gp.bpp, init=table)
 
         # what domain to run the LED engine in. framebuffers will still be
         # written to from sync.
@@ -631,7 +644,7 @@ class BufferedHUB75(Elaboratable):
         # right, top to bottom
         self.i_we = Signal()
         self.i_waddr = Signal(self.pd.chan_bits)
-        self.i_wdata = Signal(self.gamma_bpp)
+        self.i_wdata = Signal(self.gp.bpp)
 
         # our only output is to the display, which we grab direct from the
         # platform during elaboration
@@ -677,7 +690,7 @@ class BufferedHUB75(Elaboratable):
             g_waddr.eq(b_waddr),
         ]
 
-        if self.gamma is None:
+        if self.gp.gamma is None:
             # just pass data through
             m.d.sync += g_wdata.eq(b_wdata)
         else:

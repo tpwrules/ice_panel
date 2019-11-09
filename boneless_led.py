@@ -1,7 +1,7 @@
 from nmigen import *
 from nmigen_boards.icebreaker import *
 import pmod_resources
-from hub75 import PanelDescription, BufferedHUB75
+from hub75 import PanelDescription, GammaParameters, BufferedHUB75
 from pll import PLL
 
 # boneless CPU architecture stuff
@@ -12,14 +12,13 @@ from boneless.arch.opcode import *
 class BonelessLED(Elaboratable):
     def __init__(self, panel_desc, led_domain="sync"):
         self.pd = panel_desc
-
-        self.gamma_bpp = 8
+        self.gp = GammaParameters(gamma=2.5, bpp=8) 
 
         self.panel = BufferedHUB75(self.pd, led_domain=led_domain,
-            gamma=2.5, gamma_bpp=self.gamma_bpp)
+            gamma_params=self.gp)
 
         self.cpu_rom = Memory(width=16, depth=256,
-            init=Instr.assemble(firmware(self.gamma_bpp)))
+            init=Instr.assemble(firmware(self.gp.bpp)))
         self.cpu_core = CoreFSM(alsru_cls=ALSRU_4LUT, memory=self.cpu_rom)
 
     def elaborate(self, platform):
@@ -33,7 +32,7 @@ class BonelessLED(Elaboratable):
         m.d.sync += [
             panel.i_we.eq(cpu_core.o_ext_we),
             panel.i_waddr.eq(cpu_core.o_bus_addr[:self.pd.chan_bits]),
-            panel.i_wdata.eq(cpu_core.o_ext_data[:self.gamma_bpp])
+            panel.i_wdata.eq(cpu_core.o_ext_data[:self.gp.bpp])
         ]
 
         return m
