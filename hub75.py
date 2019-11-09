@@ -530,11 +530,11 @@ class PixelReader(Elaboratable):
 
         # second, we need to read pixels to fill the buffer for the next line
         rd_row = Signal(self.pd.row_bits) # which row we're reading
-        fg_rchan = Signal(3) # which channel we're reading. goes 0-2, 4-6.
+        rd_chan = Signal(3) # which channel we're reading. goes 0-2, 4-6.
         # combine into output physical address.
         # channel bits, column, row, display half bit
         m.d.comb += self.o_raddr.eq(
-            Cat(fg_rchan[:2], col_ctr.value, rd_row, fg_rchan[-1]))
+            Cat(rd_chan[:2], col_ctr.value, rd_row, rd_chan[-1]))
         
         should_count = Signal() # should we count to the next pixel?
         m.d.comb += self.col_ctr.enable.eq(should_count)
@@ -548,40 +548,49 @@ class PixelReader(Elaboratable):
         # only enable the write for the channel that the data is for.
         # of course, if gamma is enabled, we pass the data through the gamma
         # correction table before writing it.
+
+        # if we are done reading this cycle, use the data channel and address
+        # from last cycle because there is at least a 1 cycle latency through
+        # the read port, and we want to change that stuff this cycle so we can
+        # get another channel ASAP.
+        rd_wchan = Signal(3)
+        rd_waddr = Signal.like(wrport.addr)
+        m.d.sync += [
+            rd_wchan.eq(rd_chan),
+            rd_waddr.eq(Cat(col_ctr.value, rd_row[0])),
+        ]
         if self.gp.gamma is None:
             m.d.comb += wrport.data.eq(Repl(self.i_rdata, 6))
             # write data at the address of the current pixel, in the appropriate
             # buffer half
-            m.d.sync += wrport.addr.eq(Cat(col_ctr.value, rd_row[0]))
+            m.d.comb += wrport.addr.eq(rd_waddr)
             # enable the appropriate channel for writing
             for ch in range(6):
-                # we index channels from 0 to 5 here, but fg_rchan goes 0-2, 4-6
+                # we index channels from 0 to 5 here, but rd_wchan goes 0-2, 4-6
                 # because we skip 3 to keep addressing nice.
-                m.d.sync += wrport.en[ch].eq(
-                    done_reading & (fg_rchan == (ch if ch < 3 else ch+1)))
+                m.d.comb += wrport.en[ch].eq(
+                    done_reading & (rd_wchan == (ch if ch < 3 else ch+1)))
         else:
             # the above, but through the gamma table
             g_rdport = self.gamma_table.read_port()
             m.submodules += g_rdport
+            # buffer everything else an extra cycle to account for the table
+            g_waddr = Signal.like(rd_waddr)
+            g_wchan = Signal.like(rd_wchan)
+            g_done_reading = Signal.like(done_reading)
             m.d.comb += [
                 g_rdport.addr.eq(self.i_rdata),
                 wrport.data.eq(Repl(g_rdport.data, 6)),
-            ]
-            # buffer everything else an extra cycle to account for the table
-            g_waddr = Signal.like(wrport.addr)
-            g_done_reading = Signal.like(done_reading)
-            g_fg_rchan = Signal.like(fg_rchan)
-            m.d.sync += [
-                g_waddr.eq(Cat(col_ctr.value, rd_row[0])),
                 wrport.addr.eq(g_waddr),
+            ]
+            m.d.sync += [
+                g_waddr.eq(rd_waddr),
+                g_wchan.eq(rd_wchan),
                 g_done_reading.eq(done_reading),
-                g_fg_rchan.eq(fg_rchan),
             ]
             for ch in range(6):
-                # we index channels from 0 to 5 here, but fg_rchan goes 0-2, 4-6
-                # because we skip 3 to keep addressing nice.
-                m.d.sync += wrport.en[ch].eq(
-                    g_done_reading & (g_fg_rchan == (ch if ch < 3 else ch+1)))
+                m.d.comb += wrport.en[ch].eq(
+                    g_done_reading & (g_wchan == (ch if ch < 3 else ch+1)))
         
         # FSM generates the channel addresses and manages starting/ending reads
         with m.FSM("WAIT"):
@@ -597,7 +606,7 @@ class PixelReader(Elaboratable):
 
             with m.State("P0R"): # top physical pixel's red channel
                 m.d.comb += [
-                    fg_rchan.eq(0), # which is channel 0
+                    rd_chan.eq(0), # which is channel 0
                     should_read.eq(1),
                 ]
                 with m.If(done_reading): # have we got the data?
@@ -606,7 +615,7 @@ class PixelReader(Elaboratable):
 
             with m.State("P0G"): # top physical pixel's green channel
                 m.d.comb += [
-                    fg_rchan.eq(1),
+                    rd_chan.eq(1),
                     should_read.eq(1),
                 ]
                 with m.If(done_reading):
@@ -614,7 +623,7 @@ class PixelReader(Elaboratable):
 
             with m.State("P0B"): # top physical pixel's blue channel
                 m.d.comb += [
-                    fg_rchan.eq(2),
+                    rd_chan.eq(2),
                     should_read.eq(1),
                 ]
                 with m.If(done_reading):
@@ -622,7 +631,7 @@ class PixelReader(Elaboratable):
 
             with m.State("P1R"): # bottom physical pixel's red channel
                 m.d.comb += [
-                    fg_rchan.eq(4),
+                    rd_chan.eq(4),
                     should_read.eq(1),
                 ]
                 with m.If(done_reading):
@@ -630,7 +639,7 @@ class PixelReader(Elaboratable):
 
             with m.State("P1G"): # bottom physical pixel's green channel
                 m.d.comb += [
-                    fg_rchan.eq(5),
+                    rd_chan.eq(5),
                     should_read.eq(1),
                 ]
                 with m.If(done_reading):
@@ -638,7 +647,7 @@ class PixelReader(Elaboratable):
 
             with m.State("P1B"): # bottom physical pixel's blue channel
                 m.d.comb += [
-                    fg_rchan.eq(6),
+                    rd_chan.eq(6),
                     should_read.eq(1),
                 ]
                 with m.If(done_reading):
