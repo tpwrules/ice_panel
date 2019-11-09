@@ -1,7 +1,7 @@
 from nmigen import *
 from nmigen_boards.icebreaker import *
 import pmod_resources
-from hub75 import PanelDescription, GammaParameters, BufferedHUB75
+from hub75 import PanelDescription, GammaParameters, FramebufferedHUB75Driver
 from pll import PLL
 
 # boneless CPU architecture stuff
@@ -14,7 +14,7 @@ class BonelessLED(Elaboratable):
         self.pd = panel_desc
         self.gp = GammaParameters(gamma=2.5, bpp=8) 
 
-        self.panel = BufferedHUB75(self.pd, led_domain=led_domain,
+        self.panel = FramebufferedHUB75Driver(self.pd, led_domain=led_domain,
             gamma_params=self.gp)
 
         self.cpu_rom = Memory(width=16, depth=256,
