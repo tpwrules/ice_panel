@@ -51,15 +51,16 @@ _pd_fields = [
     'row_bits', # no. bits reqd. to select a row, 0 to (height//2-1)
     'pix_bits', # no. bits reqd. to select a pixel, col_bits+row_bits
     'chan_bits', # no. bits reqd. to select a physical channel of a physical
-                 # pixel. pix_bits+3, 1 to select display half, 2 to select
-                 # R, G, B or (unused). indexes e.g. framebuffer memory.
+                 # pixel. pix_bits+3, 1 to select display half, 2 to select R,
+                 # G, B or (unused). indexes e.g. framebuffer memory. channel 3
+                 # is skipped so that pixels start at multiples of 4 in memory.
 ]
 
 class PanelDescription(namedtuple("PanelDescription", _pd_fields)):
     def __new__(cls, width, height, bpp):
         # make sure BPP sounds legit. we'll overbudget our memories if 
         # it's > 16, and there would never be enough time to refresh it anyway.
-        # note also that very low BPP will probably break since the line reader
+        # note also that very low BPP will probably break since the pixel reader
         # won't have enough time to read in new lines and the display would look
         # ghosty as crap since rows are being switched way too fast.
         # TODO: detect above situation and add appropriate delay?
@@ -249,10 +250,6 @@ class FrameTimingGenerator(Elaboratable):
         self.o_col = Signal(self.pd.col_bits) # all the columns in the row
         self.o_bit = Signal(self.pd.bit_bits) # all the bits in the row's pixels
         self.o_row = Signal(self.pd.row_bits) # all the rows on the screen
-        
-        # is this an even or an odd line? flipped after every line is finished,
-        # used by the pixel reader.
-        self.o_odd_line = Signal()
 
         # non-buffered pixel data out, synchronous with line timing generator
         self.o_pixel = Signal(6)
@@ -322,11 +319,6 @@ class FrameTimingGenerator(Elaboratable):
             row_ctr.enable.eq(next_row),
             bit_ctr.reset.eq(next_row),
         ]
-
-        # if we're counting a new row, then we have finished the current one and
-        # should update if we are doing an odd row or not.
-        with m.If(next_row):
-            m.d.sync += self.o_odd_line.eq(~self.o_odd_line)
 
         # the line time counter counts every time the line cycle counter
         # finishes a line
@@ -470,32 +462,25 @@ class PixelReader(Elaboratable):
             self.line_buf.write_port(granularity=self.pd.bpp)
         m.submodules.col_ctr = col_ctr = self.col_ctr
 
-        curr_rd_line_in = Signal(self.pd.row_bits)
-        curr_rd_line_sync = FFSynchronizer(i=self.i_row, o=curr_rd_line_in,
+        # zeroth, we need to know which row the frame generator is currently
+        # working on so we can work on the next one. because it's in the LED
+        # domain and we're in sync, we have to synchronize it to us. there will
+        # be a few cycles of delay, but it's okay unless the pixel reader is
+        # like 99.99% busy.
+        fg_row = Signal(self.pd.row_bits)
+        fg_row_syncer = FFSynchronizer(i=self.i_row, o=fg_row,
             o_domain="sync", reset_less=False, stages=3)
-        m.submodules += curr_rd_line_sync
-        curr_rd_line = Signal(self.pd.row_bits)
+        m.submodules += fg_row_syncer
 
-        # zeroth, we need to know what buffer we are on. the frame generator
-        # controls that in its domain, so we need to sync it to the domain we're
-        # inputting pixels in. it's okay if it's delayed a few cycles, it
-        # shouldn't matter unless the reader is being stalled too much.
-        fg_which_buf = Signal()
-        m.d.comb += fg_which_buf.eq(self.i_odd_line)
-        pr_which_buf = Signal()
-        which_buf_sync = FFSynchronizer(i=fg_which_buf, o=pr_which_buf,
-            o_domain="sync", reset_less=False, stages=3)
-        m.submodules.which_buf_sync = which_buf_sync
-
-        # first, the pixels being read by the frame generator.
+        # first, give the frame generator the pixels it wants
         fg_data = Signal(6*self.pd.bpp)
         m.d.comb += [
-            # get read directly from the buffer
-            rdport.addr.eq(Cat(self.i_col, fg_which_buf)),
+            # they get read directly from the buffer in the LED domain
+            rdport.addr.eq(Cat(self.i_col, self.i_row[0])),
             fg_data.eq(rdport.data),
         ]
-        # then we have to select the bits from the pixels that the frame
-        # generator wants.
+        # once the memory is read, we have to select the bits from the pixels
+        # that the frame generator actually wants.
         with m.Switch(self.i_bit):
             for bn in range(self.pd.bpp): # which bit from the pixel
                 with m.Case(bn):
@@ -503,13 +488,13 @@ class PixelReader(Elaboratable):
                         m.d.comb += self.o_pixel[cn].eq(
                             fg_data[cn*self.pd.bpp+bn])
 
-        # second, state machine to read pixels to fill the buffer.
-        # it tells us the read and write channels below.
-        fg_rchan = Signal(3) # which channel we're reading. goes 0-2, 4-6
-        fg_wchan = Signal(3) # which channel we're writing. goes 0-5
-        # combine into output address. channel bits, address bits, half bit
+        # second, we need to read pixels to fill the buffer for the next line
+        rd_row = Signal(self.pd.row_bits) # which row we're reading
+        fg_rchan = Signal(3) # which channel we're reading. goes 0-2, 4-6.
+        # combine into output physical address.
+        # channel bits, column, row, display half bit
         m.d.comb += self.o_raddr.eq(
-            Cat(fg_rchan[:2], col_ctr.value, curr_rd_line, fg_rchan[-1]))
+            Cat(fg_rchan[:2], col_ctr.value, rd_row, fg_rchan[-1]))
         
         should_count = Signal() # should we count to the next pixel?
         m.d.comb += self.col_ctr.enable.eq(should_count)
@@ -518,87 +503,80 @@ class PixelReader(Elaboratable):
         done_reading = Signal() # did the pixel read finish?
         m.d.comb += done_reading.eq(self.o_re & self.i_rack)
 
-        curr_which_buf = Signal() # which buffer we're currently reading
-
         # once the pixel read finishes, we want to write it to the buffer.
         # we replicate the read channel data across the 6 memory channels, then
         # only enable the write for the channel that the data is for.
-        wr_data = Signal(self.pd.bpp)
-        m.d.comb += wrport.data.eq(Repl(wr_data, 6))
-        m.d.sync += [
-            # at the address of the current pixel
-            wrport.addr.eq(Cat(col_ctr.value, ~pr_which_buf)),
-        ]
-        m.d.comb += wr_data.eq(self.i_rdata),
-        # enable the appropriate channel
+        m.d.comb += wrport.data.eq(Repl(self.i_rdata, 6))
+        # and write it at the address of the current pixel, in the appropriate
+        # buffer half
+        m.d.sync += wrport.addr.eq(Cat(col_ctr.value, rd_row[0]))
+        # enable the appropriate channel for writing
         for ch in range(6):
+            # we index channels from 0 to 5 here, but fg_rchan goes 0-2, 4-6
+            # because we skip 3 to keep addressing nice.
             m.d.sync += wrport.en[ch].eq(
-                done_reading & (fg_wchan == ch))
+                done_reading & (fg_rchan == (ch if ch < 3 else ch+1)))
         
-        # choose which channels to read
-        
+        # FSM generates the channel addresses and manages starting/ending reads
         with m.FSM("WAIT"):
             with m.State("WAIT"): # wait for next line to begin
-                # i.e. the frame generator is reading the line we are working on
-                with m.If(pr_which_buf == curr_which_buf):
-                    # swap buffers
-                    m.d.sync += curr_which_buf.eq(~curr_which_buf)
-                    m.d.sync += curr_rd_line.eq(curr_rd_line_in+1)
+                # i.e. the frame generator is reading the line we just wrote to
+                with m.If(fg_row[0] == rd_row[0]):
+                    # so start working on the next line
+                    m.d.sync += rd_row.eq(fg_row+1)
                     # start at the first pixel
                     m.d.comb += col_ctr.reset.eq(1)
                     # and get back into it
                     m.next = "P0R"
-            with m.State("P0R"): # pixel 0's red channel
-                m.d.comb += [ # set up addresses
-                    fg_rchan.eq(0),
-                    fg_wchan.eq(0),
+
+            with m.State("P0R"): # top physical pixel's red channel
+                m.d.comb += [
+                    fg_rchan.eq(0), # which is channel 0
                     should_read.eq(1),
                 ]
                 with m.If(done_reading): # have we got the data?
                     # go to next pixel. writing is handled outside state machine
                     m.next = "P0G"
-            with m.State("P0G"): # pixel 0's green channel
-                m.d.comb += [ # set up addresses
+
+            with m.State("P0G"): # top physical pixel's green channel
+                m.d.comb += [
                     fg_rchan.eq(1),
-                    fg_wchan.eq(1),
                     should_read.eq(1),
                 ]
-                with m.If(done_reading): # have we got the data?
-                    # go to next pixel. writing is handled outside state machine
+                with m.If(done_reading):
                     m.next = "P0B"
-            with m.State("P0B"): # pixel 0's blue channel
-                m.d.comb += [ # set up addresses
+
+            with m.State("P0B"): # top physical pixel's blue channel
+                m.d.comb += [
                     fg_rchan.eq(2),
-                    fg_wchan.eq(2),
                     should_read.eq(1),
                 ]
-                with m.If(done_reading): # have we got the data?
-                    # go to next pixel. writing is handled outside state machine
+                with m.If(done_reading):
                     m.next = "P1R"
-            with m.State("P1R"): # pixel 1's red channel
-                m.d.comb += [ # set up addresses
+
+            with m.State("P1R"): # bottom physical pixel's red channel
+                m.d.comb += [
                     fg_rchan.eq(4),
-                    fg_wchan.eq(3),
                     should_read.eq(1),
                 ]
-                with m.If(done_reading): # have we got the data?
-                    # go to next pixel. writing is handled outside state machine
+                with m.If(done_reading):
                     m.next = "P1G"
-            with m.State("P1G"): # pixel 1's green channel
-                m.d.comb += [ # set up addresses
+
+            with m.State("P1G"): # bottom physical pixel's green channel
+                m.d.comb += [
                     fg_rchan.eq(5),
-                    fg_wchan.eq(4),
                     should_read.eq(1),
                 ]
-                with m.If(done_reading): # have we got the data?
+                with m.If(done_reading):
                     m.next = "P1B"
-            with m.State("P1B"): # pixel 1's blue channel
-                m.d.comb += [ # set up addresses
+
+            with m.State("P1B"): # bottom physical pixel's blue channel
+                m.d.comb += [
                     fg_rchan.eq(6),
-                    fg_wchan.eq(5),
                     should_read.eq(1),
                 ]
-                with m.If(done_reading): # have we got the data?
+                with m.If(done_reading):
+                    # address next pixel in the line
                     m.d.comb += should_count.eq(1)
                     with m.If(col_ctr.at_max): # done with this line?
                         m.next = "WAIT"
@@ -723,7 +701,6 @@ class BufferedHUB75(Elaboratable):
 
             rdport.addr.eq(pr.o_raddr),
             pr.i_rdata.eq(rdport.data),
-            pr.i_odd_line.eq(ftg.o_odd_line),
         ]
 
         m.d[self.led_domain] += pr.i_rack.eq(pr.o_re)
