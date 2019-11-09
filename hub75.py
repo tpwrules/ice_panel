@@ -472,7 +472,6 @@ class PixelReader(Elaboratable):
         self.i_col = Signal(self.pd.col_bits)
         self.i_bit = Signal(self.pd.bit_bits)
         self.i_row = Signal(self.pd.row_bits)
-        self.i_odd_line = Signal()
         # and that pixel's data
         self.o_pixel = Signal(6)
 
@@ -661,80 +660,58 @@ class PixelReader(Elaboratable):
         return m
 
 
-# a whole screen and buffer
-class BufferedHUB75(Elaboratable):
+# complete driver for a HUB75 panel, with a read master to get pixels for
+# display
+class HUB75Driver(Elaboratable):
     def __init__(self, panel_desc, led_domain="sync", gamma_params=None):
         self.pd = panel_desc
         self.gp = gamma_params
 
-        # what domain to run the LED engine in. framebuffers will still be
-        # written to from sync.
+        # what domain to run the LED engine in. pixels will still be read from
+        # sync.
         self.led_domain = led_domain
 
-        # framebuffer write inputs.
-        # the low 2 bits of the address select R, G, B, or nothing.
-        # next N bits select 2**N columns (X position).
-        # next M bits select 2**M rows (Y position).
-        # the last bit selects screen half (RGB0 or RGB1).
-        # this means the display is linearly addressed R, G, B color, left to
-        # right, top to bottom
-        self.i_we = Signal()
-        self.i_waddr = Signal(self.pd.chan_bits)
-        self.i_wdata = Signal(self.gp.bpp)
-
-        # our only output is to the display, which we grab direct from the
-        # platform during elaboration
-
-        # and have a mechanism to actually generate the display
+        # the mechanism that actually generates the display
         # (display generation happens in the LED clock domain)
         self.ftg = DomainRenamer(self.led_domain)(FrameTimingGenerator(self.pd))
 
-        # read pixels and give them to the frame generator. we want it reading
-        # from the LED domain too.
-        self.pr = DomainRenamer(self.led_domain)(
-            PixelReader(self.pd, led_domain=self.led_domain,
-                gamma_params=self.gp))
+        # module that reads pixels and gives them to the frame generator
+        self.pr = PixelReader(self.pd, led_domain=self.led_domain,
+            gamma_params=self.gp)
 
-        self.buf = Memory(width=self.pd.bpp, depth=2**self.pd.chan_bits)
+        # read master port to whatever memory has the pixel data. we assert re
+        # when we want to read a channel addressed by raddr. on the cycle that
+        # rack is asserted, we latch that channel's data in from rdata.
+
+        # the low 2 bits of the address select R, G, B, or (unused).
+        # next N bits select 2**N columns (X position).
+        # next M bits select 2**M ows (Y position).
+        # the last bit selects screen half (RGB0 or RGB1).
+        # this means the display is linearly addressed R, G, B color, left to
+        # right, top to bottom
+        self.o_re = self.pr.o_re
+        self.i_rack = self.pr.i_rack
+        self.o_raddr = self.pr.o_raddr
+        self.i_rdata = self.pr.i_rdata
 
     def elaborate(self, platform):
-        # get the display from the platform.
-        # we use DDR buffer on shift clock so we can cleanly gate it.
+        # get the display ports from the platform.
+        # we use a DDR buffer on the shift clock so we can cleanly gate it.
         hub75 = platform.request("hub75", 0, xdr={"shift_clock": 2})
-        
+
         m = Module()
         m.submodules.ftg = ftg = self.ftg
         m.submodules.pr = pr = self.pr
-        m.submodules.rdport = rdport = \
-            self.buf.read_port(domain=self.led_domain, transparent=False)
-        m.submodules.wrport = wrport = self.buf.write_port()
 
-        # handle the write data input
-        # buffer them so we can decode at our leisure
-        b_we = Signal.like(self.i_we)
-        b_waddr = Signal.like(self.i_waddr)
-        b_wdata = Signal.like(self.i_wdata)
-        m.d.sync += [ # comes from memory write domain i.e. sync
-            b_we.eq(self.i_we),
-            b_waddr.eq(self.i_waddr),
-            b_wdata.eq(self.i_wdata),
-        ]
-
+        # wire the pixel reader to the frame generator
         m.d.comb += [
-            wrport.addr.eq(b_waddr),
-            wrport.data.eq(b_wdata),
-            wrport.en.eq(b_we),
-
+            # which pixel the frame generator wants
             pr.i_row.eq(ftg.o_row),
             pr.i_col.eq(ftg.o_col),
             pr.i_bit.eq(ftg.o_bit),
+            # that pixel's data
             ftg.i_pixel.eq(pr.o_pixel),
-
-            rdport.addr.eq(pr.o_raddr),
-            pr.i_rdata.eq(rdport.data),
         ]
-
-        m.d[self.led_domain] += pr.i_rack.eq(pr.o_re)
 
         # we set the panel outputs synchronously so the panel doesn't see
         # glitches as things settle. this is done in the LED domain.
@@ -765,5 +742,69 @@ class BufferedHUB75(Elaboratable):
             hub75.shift_clock.o0.eq(0),
             hub75.shift_clock.o1.eq(ftg.o_shift_active),
         ]
+
+        return m
+
+# complete HUB75 panel driver with write port to internal framebuffer
+class FramebufferedHUB75Driver(Elaboratable):
+    def __init__(self, panel_desc, led_domain="sync", gamma_params=None):
+        self.pd = panel_desc
+        self.gp = gamma_params
+
+        # what domain to run the LED engine and pixel reader in. framebuffers
+        # will still be written to from sync.
+        self.led_domain = led_domain
+
+        # framebuffer write inputs.
+        # the low 2 bits of the address select R, G, B, or nothing.
+        # next N bits select 2**N columns (X position).
+        # next M bits select 2**M rows (Y position).
+        # the last bit selects screen half (RGB0 or RGB1).
+        # this means the display is linearly addressed R, G, B color, left to
+        # right, top to bottom
+        self.i_we = Signal()
+        self.i_waddr = Signal(self.pd.chan_bits)
+        self.i_wdata = Signal(self.gp.bpp)
+
+        # the driver does all the hard work. we just hold pixels. we have it
+        # read from the framebuffer in the LED domain since that will be faster
+        # and we can handle it.
+        self.driver = DomainRenamer(self.led_domain)(
+            HUB75Driver(self.pd, gamma_params=self.gp))
+
+        # the pixels to show on our lovely screen
+        self.buf = Memory(width=self.pd.bpp, depth=2**self.pd.chan_bits)
+
+    def elaborate(self, platform):
+        m = Module()
+        m.submodules.driver = driver = self.driver
+        m.submodules.rdport = rdport = \
+            self.buf.read_port(domain=self.led_domain, transparent=False)
+        m.submodules.wrport = wrport = self.buf.write_port()
+
+        # handle the write data input
+        # buffer them so we can decode at our leisure
+        b_we = Signal.like(self.i_we)
+        b_waddr = Signal.like(self.i_waddr)
+        b_wdata = Signal.like(self.i_wdata)
+        m.d.sync += [ # comes from memory write domain i.e. sync
+            b_we.eq(self.i_we),
+            b_waddr.eq(self.i_waddr),
+            b_wdata.eq(self.i_wdata),
+        ]
+
+        m.d.comb += [
+            # connect buffered write port to framebuffer write port
+            wrport.addr.eq(b_waddr),
+            wrport.data.eq(b_wdata),
+            wrport.en.eq(b_we),
+
+            # connect read port to pixel reader
+            rdport.addr.eq(driver.o_raddr),
+            driver.i_rdata.eq(rdport.data),
+        ]
+
+        # memory has 1 cycle latency
+        m.d[self.led_domain] += driver.i_rack.eq(driver.o_re)
 
         return m
