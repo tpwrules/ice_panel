@@ -9,6 +9,7 @@
 from nmigen import *
 from nmigen.lib.coding import Decoder
 from nmigen.lib.fifo import AsyncFIFO
+from nmigen.lib.cdc import FFSynchronizer
 
 class UpCounter(Elaboratable):
     def __init__(self, width, init=0):
@@ -168,6 +169,9 @@ class FrameTimingGenerator(Elaboratable):
         self.o_row = Signal(self.row_bits)
         self.o_col = Signal(self.col_bits)
         self.o_bit = Signal(self.bit_bits)
+        # is this an even or an odd line? flipped after every line is finished,
+        # used by the pixel reader.
+        self.o_odd_line = Signal()
 
         # non-buffered color out, synchronous with line timing generator
         self.o_rgb0 = Signal(3)
@@ -254,6 +258,10 @@ class FrameTimingGenerator(Elaboratable):
             row_ctr.enable.eq(should_count_row),
             bit_ctr.reset.eq(should_count_row),
         ]
+
+        # if we're counting a new row, then we have finished the current one and
+        # should update if we are doing an odd row or not.
+        m.d.sync += self.o_odd_line.eq(~self.o_odd_line)
 
         # the line time counter counts every time the line cycle counter
         # finishes a line
@@ -347,57 +355,203 @@ class FrameTimingGenerator(Elaboratable):
 
         return m
 
-# buffer one channel for the whole panel in BRAM at an arbitrary bpp
-class PixelBuffer(Elaboratable):
-    def __init__(self, panel_shape, bpp=1):
+# read pixels from memory and serve them to the frame generator
+class PixelReader(Elaboratable):
+    def __init__(self, panel_shape, bpp=1, in_domain="sync", out_domain="led"):
         self.panel_shape = panel_shape
         self.bpp = bpp # number of bits per pixel
+        self.in_domain = in_domain
+        self.out_domain = out_domain
 
         # calculate address widths
         self.row_bits = (panel_shape[1]//2-1).bit_length()
         self.col_bits = (panel_shape[0]-1).bit_length()
         self.bit_bits = (bpp-1).bit_length()
         self.pixel_bits = self.row_bits + self.col_bits
+        # + 1 because each address above refers to two indepdendent pixels,
+        # + 2 to select pixel color channel
+        self.addr_bits = self.pixel_bits + 1 + 2
 
-        # write input port from the CPU or whatever
-        self.i_we = Signal()
-        self.i_waddr = Signal(self.pixel_bits)
-        self.i_wdata = Signal(self.bpp)
+        # so, we have two important requirements.
+        # one: we must be able to deliver 6 pixel bits (one from each channel)
+        # to the frame generator every cycle. if we fail, the display will get
+        # glitchy.
+        # two: we must only read each line from memory once. if we read it more
+        # than once and it changes between reads, the display starts looking
+        # really funky because we are drawing one bitplane at a time and any
+        # changed pixels won't look like what they were before or after the
+        # change.
+        # to do this, we have a RAM buffer that can buffer all pixel bits for 6
+        # channels for two lines. thankfully, the frame generator doesn't need
+        # 6bits/cyc every cycle, so we do have enough time to read one pixel
+        # channel per cycle and fill up one half of the memory while we feed the
+        # other to the frame generator.
 
-        # pixel the frame generator wants to read
+        # pixel the frame generator wants to read.
         self.i_row = Signal(self.row_bits)
         self.i_col = Signal(self.col_bits)
         self.i_bit = Signal(self.bit_bits)
+        # what color the 6 channels of that pixel are.
+        self.o_pixel = Signal(6)
 
-        # what color that pixel is
-        self.o_pixel = Signal()
+        # read master port to whatever memory has the pixels. we assert re when
+        # we want to read a pixel addressed by raddr. on the cycle that rack is
+        # asserted, we latch that pixel's data in from rdata.
+        self.o_re = Signal()
+        self.i_rack = Signal()
+        self.o_raddr = Signal(self.addr_bits+2)
+        self.i_rdata = Signal(self.bpp)
 
-        self.mem = Memory(width=self.bpp, depth=2**self.pixel_bits)
+        # our buffer memory. it needs to be crazy wide so we can read 6 full
+        # pixels per cycle and select the 6 bits the frame generator wants.
+        self.line_buf = Memory(width=6*self.bpp, depth=2*self.panel_shape[0])
+
+        # counter to index the pixels when reading. we generate the half select
+        # bit and channel bits elsewhere.
+        self.pix_ctr = UpCounter(self.pixel_bits, init=0)
 
     def elaborate(self, platform):
         m = Module()
         # register submodules (and make a local reference without self)
-        m.submodules.rdport = rdport = self.mem.read_port()
-        m.submodules.wrport = wrport = self.mem.write_port()
+        m.submodules.rdport = rdport = \
+            self.line_buf.read_port(domain=self.out_domain, transparent=False)
+        # we want 6 enables so we can write 1 of 6 pixels
+        m.submodules.wrport = wrport = \
+            self.line_buf.write_port(domain=self.in_domain, granularity=6)
+        m.submodules.pix_ctr = pix_ctr = self.pix_ctr
 
-        # write port goes straight to the memory
+
+        # zeroth, we need to know what buffer we are on. the frame generator
+        # controls that in its domain, so we need to sync it to the domain we're
+        # inputting pixels in. it's okay if it's delayed a few cycles, it
+        # shouldn't matter unless the reader is being stalled too much.
+        fg_which_buf = Signal()
+        pr_which_buf = Signal()
+        which_buf_sync = FFSynchronizer(i=fg_which_buf, o=pr_which_buf,
+            o_domain=self.in_domain, reset_less=False, stages=3)
+        m.submodules.which_buf_sync = which_buf_sync
+
+        # first, the pixels being read by the frame generator.
+        fg_addr = Signal(self.pixel_bits+1)
+        fg_data = Signal(6*self.pixel_bits)
         m.d.comb += [
-            wrport.en.eq(self.i_we),
-            wrport.addr.eq(self.i_waddr),
-            wrport.data.eq(self.i_wdata),
+            fg_addr.eq(Cat(self.i_col, self.i_row, fg_which_buf)),
+            # get read directly from the buffer
+            rdport.addr.eq(fg_addr),
+            fg_data.eq(rdport.data),
         ]
+        # then we have to select the bits from the channels that the frame
+        # generator wants.
+        with m.Switch(self.i_bit):
+            for bn in range(self.bpp): # which bit from the pixel
+                with m.Case(bn):
+                    for cn in range(6): # which pixel channel
+                        m.d.comb += self.o_pixel[cn].eq(
+                            fg_data[cn*self.bpp+bn])
 
-        # read port goes to the frame generator
-        bitmasker = Decoder(self.bpp)
-        m.submodules.bitmasker = bitmasker
-        m.d.comb += [
-            bitmasker.i.eq(self.i_bit),
+        # second, state machine to read pixels to fill the buffer.
+        # it tells us the read and write channels below.
+        fg_rchan = Signal(3) # which channel we're reading. goes 0-2, 4-6
+        fg_wchan = Signal(3) # which channel we're writing. goes 0-5
+        # combine into output address. channel bits, address bits, half bit
+        m.d.comb += self.o_raddr.eq(
+            Cat(fg_rchan[:2], pix_ctr.value, fg_rchan[-1]))
+        
+        should_count = Signal() # should we count to the next pixel?
+        m.d.comb += self.pix_ctr.enable.eq(should_count)
+        should_read = Signal() # are we intending to read a pixel?
+        m.d.comb += self.o_re.eq(should_read)
+        done_reading = Signal() # did the pixel read finish?
+        m.d.comb += done_reading.eq(self.o_re & self.i_rack)
 
-            rdport.addr.eq(Cat(self.i_col, self.i_row)),
-            self.o_pixel.eq((rdport.data & bitmasker.o) != 0),
+        # once the pixel read finishes, we want to write it to the buffer.
+        # we need to replicate the pixel across the 6 channels, then we only
+        # enable the channel we got back.
+        wr_data = Signal(self.bpp)
+        m.d.comb += wrport.data.eq(Repl(wr_data, 6))
+        m.d[self.in_domain] += [
+            # at the address of the current pixel
+            wrport.addr.eq(pix_ctr.value),
+            # with the data we just got back
+            wr_data.eq(self.i_rdata),
         ]
+        # enable the appropriate channel
+        for ch in range(6):
+            m.d[self.in_domain] += wrport.en[ch].eq(
+                done_reading & (fg_wchan == ch))
+        
+        # choose which channels to read
+        curr_which_buf = Signal() # which buffer we're currently reading
+        with m.FSM("WAIT", domain=self.in_domain):
+            with m.State("WAIT"): # wait for next line to begin
+                # i.e. the frame generator is reading the line we are working on
+                with m.If(pr_which_buf == curr_which_buf):
+                    # swap buffers
+                    m.d[self.in_domain] += curr_which_buf.eq(~curr_which_buf)
+                    # start at the first pixel
+                    m.d.comb += pix_ctr.reset.eq(1)
+                    # and get back into it
+                    m.next = "P0R"
+            with m.State("P0R"): # pixel 0's red channel
+                m.d.comb += [ # set up addresses
+                    fg_rchan.eq(0),
+                    fg_wchan.eq(0),
+                    should_read.eq(1),
+                ]
+                with m.If(done_reading): # have we got the data?
+                    # go to next pixel. writing is handled outside state machine
+                    m.next = "P0G"
+            with m.State("P0G"): # pixel 0's green channel
+                m.d.comb += [ # set up addresses
+                    fg_rchan.eq(1),
+                    fg_wchan.eq(1),
+                    should_read.eq(1),
+                ]
+                with m.If(done_reading): # have we got the data?
+                    # go to next pixel. writing is handled outside state machine
+                    m.next = "P0B"
+            with m.State("P0B"): # pixel 0's blue channel
+                m.d.comb += [ # set up addresses
+                    fg_rchan.eq(2),
+                    fg_wchan.eq(2),
+                    should_read.eq(1),
+                ]
+                with m.If(done_reading): # have we got the data?
+                    # go to next pixel. writing is handled outside state machine
+                    m.next = "P1R"
+            with m.State("P1R"): # pixel 1's red channel
+                m.d.comb += [ # set up addresses
+                    fg_rchan.eq(4),
+                    fg_wchan.eq(3),
+                    should_read.eq(1),
+                ]
+                with m.If(done_reading): # have we got the data?
+                    # go to next pixel. writing is handled outside state machine
+                    m.next = "P1G"
+            with m.State("P1G"): # pixel 1's green channel
+                m.d.comb += [ # set up addresses
+                    fg_rchan.eq(5),
+                    fg_wchan.eq(4),
+                    should_read.eq(1),
+                ]
+                with m.If(done_reading): # have we got the data?
+                    m.d.comb += should_count.eq(1)
+                    m.next = "P0G"
+            with m.State("P1B"): # pixel 1's blue channel
+                m.d.comb += [ # set up addresses
+                    fg_rchan.eq(0),
+                    fg_wchan.eq(0),
+                    should_read.eq(1),
+                ]
+                with m.If(done_reading): # have we got the data?
+                    m.d.comb += should_count.eq(1)
+                    with m.If(pix_ctr.at_max): # done with this line?
+                        m.next = "WAIT"
+                    with m.Else():
+                        m.next = "P0R"
 
         return m
+
 
 # a whole screen and buffer
 class BufferedHUB75(Elaboratable):
@@ -458,23 +612,16 @@ class BufferedHUB75(Elaboratable):
         # our only output is to the display, which we grab direct from the
         # platform during elaboration
 
-        # buffer each channel of the display independently
-        self.pb_names = ("r0", "g0", "b0", "r1", "g1", "b1")
-        self.pbs = {}
-        for name in self.pb_names:
-            self.pbs[name] = DomainRenamer(self.led_domain)(
-                PixelBuffer(panel_shape, bpp=self.gamma_bpp))
-
         # and have a mechanism to actually generate the display
         # (display generation happens in the LED clock domain)
         self.ftg = DomainRenamer(self.led_domain)(
             FrameTimingGenerator(panel_shape, bpp=self.gamma_bpp))
 
-        # FIFO for pixel writes to the buffer. necessary to prevent
-        # metastability in the buffer RAMs from causing display glitches. it
-        # doesn't need to be deep because we can quickly read it.
-        self.wr_fifo = AsyncFIFO(width=self.addr_bits+self.bpp, depth=1024,
-            w_domain="sync", r_domain=self.led_domain)
+        # read pixels and give them to the frame generator
+        self.pr = PixelReader(panel_shape, bpp=self.bpp,
+            in_domain=self.led_domain, out_domain=self.led_domain)
+
+        self.buf = Memory(width=self.gamma_bpp, depth=self.addr_bits)
 
     def elaborate(self, platform):
         # get the display from the platform.
@@ -483,99 +630,57 @@ class BufferedHUB75(Elaboratable):
         
         m = Module()
         m.submodules.ftg = ftg = self.ftg
-        m.submodules.wr_fifo = wr_fifo = self.wr_fifo
-        pbs = self.pbs
-        for name, buffer in pbs.items():
-            # register all the buffers we made
-            setattr(m.submodules, name, buffer)
+        m.submodules.pr = pr = self.pr
+        m.submodules.rdport = rdport = \
+            self.buf.read_port(domain=self.led_domain)
+        m.submodules.wrport = wrport = self.buf.write_port()
 
-        # handle the write data input by immediately sticking it in the FIFO for
-        # the LED domain to handle
-        m.d.sync += [
-            wr_fifo.w_en.eq(self.i_we),
-            wr_fifo.w_data.eq(Cat(self.i_waddr, self.i_wdata)),
-        ]
-
-        # once it pops back out, we latch it into another buffer for
-        # metastability prevention.
+        # handle the write data input
+        # buffer them so we can decode at our leisure
         b_we = Signal.like(self.i_we)
         b_waddr = Signal.like(self.i_waddr)
         b_wdata = Signal.like(self.i_wdata)
-        # turns out that if we write to the pixel memory while that line is
-        # being displayed, the display can glitch, presumably because it's drawn
-        # as bitplanes and it looks weird if the pixel changes halfway through
-        # the bits.
-        should_read = Signal()
-        # r_rdy gets asserted when there is data to be read. we want it ASAP.
-        m.d.comb += wr_fifo.r_en.eq(wr_fifo.r_rdy & should_read)
-        # the data will be ready on r_data...
-        m.d.comb += Cat(b_waddr, b_wdata).eq(wr_fifo.r_data)
-        # the cycle after r_rdy is asserted.
-        m.d[self.led_domain] += b_we.eq(wr_fifo.r_rdy & should_read)
-        # only complete the read if the destination row doesn't match the
-        # currently displayed row
-        row_bits, col_bits = self.row_bits, self.col_bits
-        m.d.comb += should_read.eq(
-            (b_waddr[2+col_bits:2+col_bits+row_bits] != self.ftg.o_row))
-
-
-        # now we can gamma correct the data
+        # and once more, so we can gamma correct the data
         g_we = Signal.like(self.i_we)
         g_waddr = Signal.like(self.i_waddr)
         g_wdata = Signal(self.gamma_bpp)
-        m.d[self.led_domain] += [
+        m.d.sync += [ # comes from memory write domain i.e. sync
+            b_we.eq(self.i_we),
+            b_waddr.eq(self.i_waddr),
+            b_wdata.eq(self.i_wdata),
             # gamma correction doesn't modify WE or address
-            g_we.eq(b_we & should_read),
+            g_we.eq(b_we),
             g_waddr.eq(b_waddr),
         ]
 
         if self.gamma is None:
             # just pass data through
-            m.d[self.led_domain] += g_wdata.eq(b_wdata)
+            m.d.sync += g_wdata.eq(b_wdata)
         else:
             # wire through gamma lookup table
-            g_rdport = self.gamma_table.read_port(domain=self.led_domain)
+            g_rdport = self.gamma_table.read_port()
             m.submodules += g_rdport
             m.d.comb += [
                 g_rdport.addr.eq(b_wdata),
                 g_wdata.eq(g_rdport.data),
             ]
 
-        # split the write address into the various pixel addresses
-        addr_color = Signal(2)
-        addr_row = Signal(self.row_bits)
-        addr_col = Signal(self.col_bits)
-        addr_half = Signal()
         m.d.comb += [
-            addr_color.eq(g_waddr[:2]),
-            addr_col.eq(g_waddr[2:2+col_bits]),
-            addr_row.eq(g_waddr[2+col_bits:2+col_bits+row_bits]),
-            addr_half.eq(g_waddr[2+col_bits+row_bits]),
+            wrport.addr.eq(g_waddr),
+            wrport.data.eq(g_wdata),
+            wrport.en.eq(g_we),
+
+            pr.i_row.eq(ftg.o_row),
+            pr.i_col.eq(ftg.o_col),
+            pr.i_bit.eq(ftg.o_bit),
+            Cat(ftg.i_rgb0, ftg.i_rgb1).eq(pr.o_pixel),
+
+            rdport.addr.eq(pr.o_raddr),
+            pr.i_rdata.eq(rdport.data),
         ]
 
-        # then wire up those addresses to the pixel buffers
-        for name, buffer in pbs.items():
-            color_en = Signal() # addressed color matches this buffer?
-            half_en = Signal() # addressed display half matches this buffer?
-            m.d.comb += [
-                color_en.eq(addr_color == "rgb".index(name[0])),
-                half_en.eq(addr_half == "01".index(name[1])),
+        m.d[self.led_domain] += pr.i_rack.eq(pr.o_re)
 
-                buffer.i_we.eq(color_en & half_en & g_we),
-                buffer.i_waddr.eq(Cat(addr_col, addr_row)),
-                buffer.i_wdata.eq(g_wdata),
-            ]
-
-        # tell the buffers what pixel the frame generator wants
-        for name, buffer in pbs.items():
-            m.d.comb += [
-                buffer.i_row.eq(ftg.o_row),
-                buffer.i_col.eq(ftg.o_col),
-                buffer.i_bit.eq(ftg.o_bit),
-            ]
-        # then wire the retrieved pixel back into the frame generator
-        m.d.comb += ftg.i_rgb0.eq(Cat(pbs[n+"0"].o_pixel for n in "rgb"))
-        m.d.comb += ftg.i_rgb1.eq(Cat(pbs[n+"1"].o_pixel for n in "rgb"))
 
         # we set the panel outputs synchronously so the panel doesn't see
         # glitches as things settle. this is done in the LED domain.
