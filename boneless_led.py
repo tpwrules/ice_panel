@@ -171,12 +171,12 @@ class Top(Elaboratable):
         self.led_freq_mhz = led_freq_mhz
 
     def elaborate(self, platform):
-        # reserve the clock pin before it gets switched to the default domain
-        clk_pin = platform.request(platform.default_clk, dir="-")
-
         m = Module()
         if self.led_freq_mhz != 12:
-            # create the PLL to run the LED engine faster than the cpu and stuff
+            # we need a PLL so we can boost the clock. reserve the clock pin
+            # before it gets switched to the default domain.
+            clk_pin = platform.request(platform.default_clk, dir="-")
+            # then create the PLL
             pll = PLL(12, self.led_freq_mhz, clk_pin,
                 orig_domain_name="cpu", # runs at 12MHz
                 pll_domain_name="led", # runs at the LED frequency
@@ -185,11 +185,11 @@ class Top(Elaboratable):
             led_domain = "led"
         else:
             # the user doesn't want to run faster and the PLL can't make
-            # input = output, so just create the CPU domain using the original
-            # clock and run the LEDs in that domain
+            # input = output, so just create the CPU domain using the default
+            # clock and run the LEDs in that domain too.
             cpu = ClockDomain("cpu")
             m.domains += cpu
-            m.d.comb += ClockSignal("cpu").eq(clk_pin)
+            m.d.comb += ClockSignal("cpu").eq(ClockSignal("sync"))
             led_domain = "cpu"
 
         # create the actual demo and tell it to run in the domain we made
@@ -207,11 +207,11 @@ class Top(Elaboratable):
 panel_desc = PanelDescription(width=32, height=16, bpp=10)
 
 if __name__ == "__main__":
-    design = Top(panel_desc=panel_desc, led_freq_mhz=40)
-    ICEBreakerPlatform().build(design, do_program=True, synth_opts="-abc9")
-
-# if __name__ == "__main__":
-#     from nmigen.cli import main
-#     design = Top(panel_desc=panel_desc, led_freq_mhz=12)
-#     main(design, platform=ICEBreakerPlatform(),
-#         ports=[v for k, v in design.__dict__.items() if k.startswith("p_") ])
+    from nmigen.cli import main
+    import sys
+    simulating = sys.argv[1] == "simulate"
+    design = Top(panel_desc=panel_desc,
+        # we can't simulate with different LED and CPU frequencies
+        led_freq_mhz=12 if simulating else 40)
+    main(design, platform=ICEBreakerPlatform(),
+        build_args={"synth_opts": "-abc9"})
