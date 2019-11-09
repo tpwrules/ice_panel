@@ -7,8 +7,6 @@
 # RGB0 and the other for RGB1. except for in the buffered addresses!
 
 from nmigen import *
-from nmigen.lib.coding import Decoder
-from nmigen.lib.fifo import AsyncFIFO
 from nmigen.lib.cdc import FFSynchronizer
 
 class UpCounter(Elaboratable):
@@ -59,8 +57,6 @@ class LineTimingGenerator(Elaboratable):
         # which line is being displayed. latched at the end of the line or so
         self.i_line_addr = Signal((panel_shape[1]//2-1).bit_length())
 
-        # line sync output. asserted during the last pixel of the line.
-        self.o_line_sync = Signal()
         # shift active output. asserted when actively shifting pixels (and thus
         # the panel should receive the shift clock)
         self.o_shift_active = Signal()
@@ -102,15 +98,11 @@ class LineTimingGenerator(Elaboratable):
                 with m.If(pixel_ctr.at_max):
                     # yes, so the line is over
                     m.next = "BLANK"
-                    # and we want to emit the sync pulse
-                    m.d.sync += self.o_line_sync.eq(1)
 
             with m.State("BLANK"):
                 # we blank the display so there's no glitches as we apply the
                 # new pixels
                 m.d.comb += self.o_blank.eq(1)
-                # and finish the sync pulse
-                m.d.sync += self.o_line_sync.eq(0)
 
                 m.next = "ADDR"
 
@@ -179,7 +171,6 @@ class FrameTimingGenerator(Elaboratable):
 
         self.ltg = LineTimingGenerator(panel_shape)
         # and all the line generator outputs
-        self.o_line_sync = self.ltg.o_line_sync
         self.o_shift_active = self.ltg.o_shift_active
         self.o_latch = self.ltg.o_latch
         self.o_blank = self.ltg.o_blank
@@ -272,14 +263,6 @@ class FrameTimingGenerator(Elaboratable):
             line_cycle_ctr.reset.eq(
                 line_cycle_ctr.value == self.num_line_cycles-1),
         ]
-        # so uh the output of this doesn't go to anything anymore, but keeping
-        # it improves fmax significantly (by like 20%) and saves LUTs to boot.
-        # however, this only applies if this variable name "bitmasker" matches
-        # the variable name "bitmasker" in the PixelBuffer module.
-        # ?????
-        bitmasker = Decoder(self.bpp)
-        m.submodules.bitmasker = bitmasker
-        m.d.comb += bitmasker.i.eq(self.o_bit)
 
         # we compare it with which bit of the pixel we are processing. since
         # generating that bit from the bit counter is expensive, we instead
@@ -407,8 +390,7 @@ class PixelReader(Elaboratable):
 
         # our buffer memory. it needs to be crazy wide so we can read 6 full
         # pixels per cycle and select the 6 bits the frame generator wants.
-        self.line_buf = Memory(width=6*self.bpp, depth=2*self.panel_shape[0],
-            init=[2**(6*self.bpp)-1]*(2*self.panel_shape[0]))
+        self.line_buf = Memory(width=6*self.bpp, depth=2*self.panel_shape[0])
 
         # counter to index the pixels when reading. we generate the half select
         # bit and channel bits elsewhere.
@@ -429,7 +411,6 @@ class PixelReader(Elaboratable):
             o_domain="sync", reset_less=False, stages=3)
         m.submodules += curr_rd_line_sync
         curr_rd_line = Signal(self.row_bits)
-        #m.d.comb += curr_rd_line.eq(3)
 
         # zeroth, we need to know what buffer we are on. the frame generator
         # controls that in its domain, so we need to sync it to the domain we're
