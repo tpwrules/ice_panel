@@ -81,8 +81,8 @@ def firmware(bpp):
         MOVI(temp2, (period>>16)+1),
     L("delay"),
         SUBI(temp1, temp1, 1),
-        SBBI(temp2, temp2, 0),
-        JNZ ("delay"),
+        SBCI(temp2, temp2, 0),
+        BNZ ("delay"),
 
         # then switch colors and do it again
         ADDI(curr_color, curr_color, 1),
@@ -114,11 +114,11 @@ def firmware(bpp):
     L("display_ch_row"),
         MOVI(temp2, 0), # assume this pixel is off
         ANDI(temp1, curr_font_data, 0x80), # but maybe it's on?
-        JZ("no_pix"), # skip drawing 0 pixels to avoid filling up FIFO
+        BZ("no_pix"), # skip drawing 0 pixels to avoid filling up FIFO
          # oh wait it is. ramp color up and down all cool-like
         ANDI(temp2, curr_color, 0xFF),
         ANDI(temp1, curr_color, 0x100),
-        JZ("display_ch_row_pix_off"),
+        BZ("display_ch_row_pix_off"),
         SUBI(temp1, temp1, 1),
         SUB(temp2, temp1, temp2),
     L("display_ch_row_pix_off"),
@@ -132,17 +132,17 @@ def firmware(bpp):
         SLLI(curr_font_data, curr_font_data, 1),
         # done with this character?
         SUBI(ch_pixels_remaining, ch_pixels_remaining, 1),
-        JNZ("display_ch_row"),
+        BNZ("display_ch_row"),
         # move to next character
         ADDI(curr_msg_ptr, curr_msg_ptr, 1),
         CMPI(curr_msg_ptr, 5), # done with this message half?
-        JNZ("display_msg_row"),
+        BNZ("display_msg_row"),
         # we only draw 6*5=30 out of 32 pixels, thus skip the last 2 so we start
         # at the next row.
         ADDI(curr_fb_ptr, curr_fb_ptr, (32-(6*5))*4),
         MOVI(curr_msg_ptr, 0), # start from first character on next row
         ANDI(temp1, curr_fb_ptr, 7<<7), # done with all the rows?
-        JNZ("display_msg_row"),
+        BNZ("display_msg_row"),
         JR(proc_ptr, 0),
     ]
     # adding data just consists of appending it to the instruction stream
