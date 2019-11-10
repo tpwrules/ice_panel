@@ -106,9 +106,7 @@ def firmware(bpp):
         ANDI(temp2, curr_fb_ptr, 7<<7), # pull row out of framebuffer pointer
         SRLI(temp2, temp2, 7),
         OR(temp1, temp1, temp2),
-        MOVR(temp2, "fontdata"),
-        ADD(temp1, temp1, temp2),
-        LD(curr_font_data, temp1, 0),
+        LDR(curr_font_data, temp1, "fontdata"),
         # font is six pixels wide
         MOVI(ch_pixels_remaining, 6),
     L("display_ch_row"),
