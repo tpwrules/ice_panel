@@ -208,10 +208,11 @@ panel_desc = PanelDescription(width=32, height=16, bpp=10)
 
 if __name__ == "__main__":
     from cli import main
-    import sys
-    simulating = sys.argv[1] == "simulate"
-    design = Top(panel_desc=panel_desc,
-        # we can't simulate with different LED and CPU frequencies
-        led_freq_mhz=12 if simulating else 40)
-    main(design, platform=ICEBreakerPlatform(),
-        build_args={"synth_opts": "-abc9"})
+    def make(simulating):
+        design = Top(panel_desc=panel_desc,
+            # we can't simulate with different LED and CPU frequencies
+            led_freq_mhz=(12 if simulating else 40))
+        platform = ICEBreakerPlatform()
+        return design, platform
+
+    main(maker=make, build_args={"synth_opts": "-abc9"})

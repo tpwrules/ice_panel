@@ -37,9 +37,9 @@ def main_parser(parser=None):
     return parser
 
 
-def main_runner(parser, args, design, platform=None, name="top", ports=(),
-        build_args={}):
+def main_runner(parser, args, maker, ports=(), build_args={}):
     if args.action == "simulate":
+        design, platform = maker(simulating=True)
         fragment = Fragment.get(design, platform)
         with pysim.Simulator(fragment,
                 vcd_file=args.vcd_file,
@@ -49,11 +49,8 @@ def main_runner(parser, args, design, platform=None, name="top", ports=(),
             sim.run_until(args.sync_period * args.sync_clocks, run_passive=True)
     
     if args.action == "build":
-        if platform is not None:
-            platform.build(design, do_program=args.program, **build_args)
-        else:
-            raise Exception("program never defined platform to build on")
-
+        design, platform = maker(simulating=False)
+        platform.build(design, do_program=args.program, **build_args)
 
 def main(*args, **kwargs):
     parser = main_parser()
