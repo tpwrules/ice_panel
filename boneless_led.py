@@ -207,7 +207,7 @@ class Top(Elaboratable):
 panel_desc = PanelDescription(width=32, height=16, bpp=10)
 
 if __name__ == "__main__":
-    from nmigen.cli import main
+    from cli import main
     import sys
     simulating = sys.argv[1] == "simulate"
     design = Top(panel_desc=panel_desc,
