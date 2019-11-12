@@ -234,6 +234,7 @@ class Top(Elaboratable):
 
     def elaborate(self, platform):
         m = Module()
+        reset_btn = platform.request("button", 0) # should be the user button
         if self.led_freq_mhz != 12:
             # we need a PLL so we can boost the clock. reserve the clock pin
             # before it gets switched to the default domain.
@@ -244,6 +245,7 @@ class Top(Elaboratable):
                 pll_domain_name="led", # runs at the LED frequency
             )
             m.submodules.pll = pll
+            m.d.comb += pll.reset.eq(~reset_btn)
             led_domain = "led"
         else:
             # the user doesn't want to run faster and the PLL can't make

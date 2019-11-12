@@ -38,6 +38,7 @@ class PLL(Elaboratable):
         self.coeff = self._calc_freq_coefficients()
 
         self.clk_pin = clk_pin
+        self.reset = Signal(reset=1)
         self.pll_lock = Signal()
 
         self.orig_domain_name = orig_domain_name
@@ -79,7 +80,7 @@ class PLL(Elaboratable):
             p_FILTER_RANGE=0b001,
 
             i_PACKAGEPIN=self.clk_pin,
-            i_RESETB=Const(1),
+            i_RESETB=self.reset,
             i_BYPASS=Const(0),
 
             o_PLLOUTGLOBALA=ClockSignal(self.orig_domain_name),
