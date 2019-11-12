@@ -1,6 +1,7 @@
 # a UART for Boneless
 
 from nmigen import *
+from nmigen.lib.cdc import FFSynchronizer
 from boneless.arch.opcode import *
 
 # Register Map
@@ -149,7 +150,7 @@ class SimpleUART(Elaboratable):
             bit_ctr = Signal(range(self.char_bits+2))
             # shift out the data bits and stop bit
             out_buf = Signal(self.char_bits+1)
-            # count cycles per half baud
+            # count cycles per baud
             baud_ctr = Signal(16)
 
             # send out a new bit when the state machine requests it
@@ -214,5 +215,96 @@ class SimpleUART(Elaboratable):
                             m.next = "SEND"
 
         tx()
+
+        # receive data (written in a function to keep locals under control)
+        def rx():
+            # count out the bits we're receiving (including start)
+            bit_ctr = Signal(range(self.char_bits+1))
+            # shift in the data bits, plus start and stop
+            in_buf = Signal(self.char_bits+2)
+            # count cycles per half baud
+            baud_ctr = Signal(16)
+
+            # since the rx pin is attached to arbitrary external logic, we
+            # should sync it with our domain first.
+            i_rx = Signal(reset=1)
+            rx_sync = FFSynchronizer(self.i_rx, i_rx, reset=1)
+            m.submodules.rx_sync = rx_sync
+            # receive a new bit when the state machine requests it
+            receive_bit = Signal()
+            with m.If(receive_bit):
+                # shift bits into the MSB so the first bit ends up at the LSB
+                # once we are done.
+                m.d.sync += in_buf.eq(Cat(in_buf[1:], i_rx))
+
+            # automatically count down the time per baud
+            baud_ctr_reset = Signal()
+            # load half the divisor so we can sample at half bit times
+            baud_ctr_half_reset = Signal()
+            baud_ctr_done = Signal()
+            m.d.comb += baud_ctr_done.eq(baud_ctr == 0)
+            with m.If(baud_ctr_reset):
+                m.d.sync += baud_ctr.eq(r0_baud_divisor)
+            with m.Elif(baud_ctr_half_reset):
+                m.d.sync += baud_ctr.eq(r0_baud_divisor>>1)
+            with m.Elif(~baud_ctr_done):
+                m.d.sync += baud_ctr.eq(baud_ctr-1)
+
+            with m.FSM("IDLE"):
+                with m.State("IDLE"):
+                    # has the receive line been asserted? (todo, maybe debounce
+                    # this a couple cycles? is that even a problem?)
+                    with m.If(~i_rx):
+                        m.d.sync += [
+                            # start counting down the bits (minus stop)
+                            bit_ctr.eq(self.char_bits+1-1),
+                            # and tell the user that we're actively receiving
+                            r0_rx_active.eq(1),
+                        ]
+                        # start the baud counter at half the baud time. this way
+                        # we end up halfway through the start bit when we next
+                        # sample and can make sure that rx is still asserted.
+                        # we're also then lined up to sample the rest of the
+                        # bits in the middle.
+                        m.d.comb += baud_ctr_half_reset.eq(1)
+                        # then just receive the start bit like any other
+                        m.next = "RECV"
+
+                with m.State("RECV"):
+                    with m.If(baud_ctr_done):
+                        # sample the bit once it's time
+                        m.d.comb += receive_bit.eq(1)
+                        with m.If(bit_ctr == 0): # only the stop bit remains?
+                            # yes, sample it (this cycle) and finish up next
+                            m.next = "FINISH"
+                        with m.Else():
+                            # and wait for another
+                            m.d.comb += baud_ctr_reset.eq(1)
+                            m.d.sync += bit_ctr.eq(bit_ctr-1)
+
+                with m.State("FINISH"):
+                    # make sure that the start bit is 0 and the stop bit is 1,
+                    # like the standard prescribes.
+                    with m.If((in_buf[0] == 0) & (in_buf[-1] == 1)):
+                        # store the data to the "FIFO" if we have space
+                        with m.If(r3_rx_empty.value):
+                            # minus start and stop bits
+                            m.d.sync += r3_rx_data.eq(in_buf[1:-1])
+                            m.d.comb += r3_rx_empty.reset.eq(1)
+                        with m.Else():
+                            m.d.comb += r1_rx_overflow.set.eq(1)
+                    with m.Else():
+                        # we didn't actually receive a character. let
+                        # the user know that something bad happened.
+                        m.d.comb += r1_rx_error.set.eq(1)
+                    # but we did finish receiving no matter what happened
+                    m.d.sync += r0_rx_active.eq(0)
+                    m.next = "IDLE"
+                    # technially, there's still half a bit time until the stop
+                    # bit is over, but that's ok. the rx line is deasserted
+                    # during that time so we won't accidentally start receiving
+                    # another bit.
+
+        rx()
 
         return m

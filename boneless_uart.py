@@ -131,13 +131,18 @@ def firmware(bpp):
         ST(temp2, temp1, 0),
         JAL(proc_ptr, "display_msg_row"),
 
-    L("busy2"), # loop while the UART doesn't have space for another char
+        # fun little echo demo
+        LDXA(temp2, 3),
+        ANDI(temp1, temp2, 0x8000),
+        BNZ("e_done"),
+
+    L("e_tx_busy"), # loop while the UART doesn't have space for another char
         LDXA(temp1, 2),
         ANDI(temp1, temp1, 0x8000),
-        BNZ("busy2"),
-        MOVI(temp1, ord("C")),
-        STXA(temp1, 2),
+        BNZ("e_tx_busy"),
+        STXA(temp2, 2),
 
+    L("e_done"),
         # wait some time for the message to show
         MOVI(temp1, period&0xffff),
         MOVI(temp2, (period>>16)+1),
