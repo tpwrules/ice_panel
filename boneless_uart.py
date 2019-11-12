@@ -20,12 +20,12 @@ class BonelessLED(Elaboratable):
         self.panel = FramebufferedHUB75Driver(self.pd, led_domain=led_domain,
            gamma_params=self.gp)
 
-        self.cpu_rom = Memory(width=16, depth=256,
+        self.cpu_rom = Memory(width=16, depth=512,
             init=Instr.assemble(firmware(self.gp.bpp)))
         self.cpu_core = CoreFSM(alsru_cls=ALSRU_4LUT, memory=self.cpu_rom)
 
         self.uart = uart.SimpleUART(
-            default_divisor=uart.calculate_divisor(12e6, 9600))
+            default_divisor=uart.calculate_divisor(12e6, 115200))
 
     def elaborate(self, platform):
         platform.add_resources(pmod_resources.hub75_pmod)
@@ -53,7 +53,7 @@ class BonelessLED(Elaboratable):
         ]
 
         # then to the UART
-        m.d.sync += [
+        m.d.comb += [
             uart.i_re.eq(cpu_core.o_ext_re & uart_en),
             uart.i_we.eq(cpu_core.o_ext_we & uart_en),
             uart.i_addr.eq(cpu_core.o_bus_addr[:2]),
@@ -88,6 +88,8 @@ def firmware(bpp):
         temp2 = R3
 
         return [
+            # "helloworld" or "delloworld", who knows?
+            NOP(0), NOP(0),
             MOVI(curr_msg_ptr, 0),
         L("sendch"),
             LDR(curr_char, curr_msg_ptr, "message"),
@@ -102,15 +104,7 @@ def firmware(bpp):
             BNE("sendch"),
         ]
 
-    fw = [ #fw_uart(),
-        L("begin"),
-        MOVI(curr_color, ord("A")),
-        STXA(curr_color, 2),
-    L("full"),
-        LDXA(curr_color, 2),
-        ANDI(curr_color, curr_color, 0x8000),
-        BNZ("full"),
-        J("begin"),
+    fw = [fw_uart(),
         MOVI(curr_color, 0),
     L("display_msg"),
         # draw first half of message on top half of screen
@@ -141,7 +135,7 @@ def firmware(bpp):
         LDXA(temp1, 2),
         ANDI(temp1, temp1, 0x8000),
         BNZ("busy2"),
-        MOVI(temp1, ord("A")),
+        MOVI(temp1, ord("C")),
         STXA(temp1, 2),
 
         # wait some time for the message to show

@@ -205,8 +205,7 @@ class SimpleUART(Elaboratable):
                             m.d.sync += [
                                 # yes, we are done!
                                 r0_tx_active.eq(0),
-                                # leave the bus idle
-                                self.o_tx.eq(0),
+                                # the stop bit leaves the bus idle
                             ]
                             m.next = "IDLE"
                         with m.Else():
