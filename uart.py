@@ -6,7 +6,7 @@ from boneless.arch.opcode import *
 # Register Map
 
 # 0x0: (W) Baud Rate / (R) Status
-#   Write:   15-0: Baud Rate divisor. rate = ((input freq/2)/divisor)-1
+#   Write:   15-0: Baud Rate divisor. rate = (input freq/divisor)-1
 #    Read: bit 15: 1 if transmission in progress, 0 otherwise
 #          bit  0: 1 if reception in progress, 0 otherwise
 
@@ -52,7 +52,7 @@ class SetReset(Elaboratable):
         return m
 
 def calculate_divisor(freq, baud):
-    return int(freq/(2*baud))-1
+    return int(freq/baud)-1
 
 class SimpleUART(Elaboratable):
     def __init__(self, default_divisor=0, char_bits=8):
@@ -160,7 +160,7 @@ class SimpleUART(Elaboratable):
                     out_buf.eq(out_buf >> 1),
                 ]
 
-            # automatically count down the time per half baud
+            # automatically count down the time per baud
             baud_ctr_reset = Signal()
             baud_ctr_done = Signal()
             m.d.comb += baud_ctr_done.eq(baud_ctr == 0)
@@ -188,17 +188,11 @@ class SimpleUART(Elaboratable):
                         ]
                         # start counting down this baud time
                         m.d.comb += baud_ctr_reset.eq(1)
-                        m.next = "BAUD0"
+                        m.next = "SEND"
 
-                with m.State("BAUD0"):
-                    # nothing to do here, just passing the time...
-                    with m.If(baud_ctr_done):
-                        m.d.comb += baud_ctr_reset.eq(1)
-                        m.next = "BAUD1"
-
-                with m.State("BAUD1"):
-                    # but once the half baud timer expires here, we need to send
-                    # out a new bit.
+                with m.State("SEND"):
+                    # once the baud timer expires, we need to send out a new
+                    # bit.
                     with m.If(baud_ctr_done):
                         # are we on the last bit?
                         with m.If(bit_ctr == 0):
@@ -217,7 +211,7 @@ class SimpleUART(Elaboratable):
                             ]
                             # one less bit to go
                             m.d.sync += bit_ctr.eq(bit_ctr-1)
-                            m.next = "BAUD0"
+                            m.next = "SEND"
 
         tx()
 
