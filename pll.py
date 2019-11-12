@@ -91,10 +91,8 @@ class PLL(Elaboratable):
         m.submodules += pll
         m.submodules += ResetSynchronizer(
             ~self.pll_lock, domain=self.pll_domain_name)
-        # there should be a reset synchronizer for the original domain too, but
-        # making one breaks nmigen for some reason.
-        # m.submodules += ResetSynchronizer(
-        #     ~self.pll_lock, domain=self.orig_domain_name)
+        m.submodules += ResetSynchronizer(
+            ~self.pll_lock, domain=self.orig_domain_name)
 
         m.domains += self.orig_domain
         m.domains += self.pll_domain
