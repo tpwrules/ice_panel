@@ -25,13 +25,13 @@ from boneless.arch.opcode import *
 #             n-0: read character, if the RX FIFO is not empty
 
 class SetReset(Elaboratable):
-    def __init__(self, module, prefer_set=True):
+    def __init__(self, module, prefer_set=True, initial=False):
         # prefer_set: if True, set takes priority over reset
         self.prefer_set = prefer_set
 
         self.set = Signal()
         self.reset = Signal()
-        self.value = Signal()
+        self.value = Signal(reset=initial)
 
         # add ourselves. removes the need for the user to add us.
         module.submodules += self
@@ -88,7 +88,7 @@ class SimpleUART(Elaboratable):
         r2_tx_full = SetReset(m, prefer_set=False)
         r2_tx_data = Signal(self.char_bits)
 
-        r3_rx_empty = SetReset(m, prefer_set=False)
+        r3_rx_empty = SetReset(m, prefer_set=False, initial=True)
         r3_rx_data = Signal(self.char_bits)
 
 
@@ -218,11 +218,11 @@ class SimpleUART(Elaboratable):
 
         # receive data (written in a function to keep locals under control)
         def rx():
-            # count out the bits we're receiving (including start)
-            bit_ctr = Signal(range(self.char_bits+1))
+            # count out the bits we're receiving (including start and stop)
+            bit_ctr = Signal(range(self.char_bits+2-1))
             # shift in the data bits, plus start and stop
             in_buf = Signal(self.char_bits+2)
-            # count cycles per half baud
+            # count cycles per baud
             baud_ctr = Signal(16)
 
             # since the rx pin is attached to arbitrary external logic, we
@@ -256,8 +256,8 @@ class SimpleUART(Elaboratable):
                     # this a couple cycles? is that even a problem?)
                     with m.If(~i_rx):
                         m.d.sync += [
-                            # start counting down the bits (minus stop)
-                            bit_ctr.eq(self.char_bits+1-1),
+                            # start counting down the bits
+                            bit_ctr.eq(self.char_bits+2-1),
                             # and tell the user that we're actively receiving
                             r0_rx_active.eq(1),
                         ]
@@ -274,7 +274,7 @@ class SimpleUART(Elaboratable):
                     with m.If(baud_ctr_done):
                         # sample the bit once it's time
                         m.d.comb += receive_bit.eq(1)
-                        with m.If(bit_ctr == 0): # only the stop bit remains?
+                        with m.If(bit_ctr == 0): # this is the stop bit?
                             # yes, sample it (this cycle) and finish up next
                             m.next = "FINISH"
                         with m.Else():
