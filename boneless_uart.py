@@ -97,7 +97,7 @@ def firmware(bpp):
             LDXA(temp1, 2),
             ANDI(temp1, temp1, 0x8000),
             BNZ("busy"),
-            ADDI(curr_char, curr_char, ord('d')),
+            ADDI(curr_char, curr_char, ord('a')),
             STXA(curr_char, 2),
             ADDI(curr_msg_ptr, curr_msg_ptr, 1),
             CMPI(curr_msg_ptr, 10),
@@ -131,16 +131,30 @@ def firmware(bpp):
         ST(temp2, temp1, 0),
         JAL(proc_ptr, "display_msg_row"),
 
-        # fun little echo demo
-        LDXA(temp2, 3),
-        ANDI(temp1, temp2, 0x8000),
-        BNZ("e_done"),
+        # let the user type their own characters!
+        LDXA(curr_font_data, 3),
+        ANDI(temp1, curr_font_data, 0x8000), # is there one available?
+        BNZ("e_done"), # nope, sorry
 
+        # there is. shuffle the message characters back to make room for it
+        MOVI(curr_msg_ptr, 0),
+    L("shuffle"),
+        ADDI(temp1, curr_msg_ptr, 1),
+        LDR(temp1, temp1, "message"),
+        STR(temp1, curr_msg_ptr, "message"),
+        ADDI(curr_msg_ptr, curr_msg_ptr, 1),
+        CMPI(curr_msg_ptr, 9),
+        BNE("shuffle"),
+        # then put the new character in after
+        SUBI(temp1, curr_font_data, ord('a')),
+        STR(temp1, curr_msg_ptr, "message"),
+
+        # be sure to echo the character
     L("e_tx_busy"), # loop while the UART doesn't have space for another char
         LDXA(temp1, 2),
         ANDI(temp1, temp1, 0x8000),
         BNZ("e_tx_busy"),
-        STXA(temp2, 2),
+        STXA(curr_font_data, 2),
 
     L("e_done"),
         # wait some time for the message to show
@@ -181,7 +195,7 @@ def firmware(bpp):
     L("display_ch_row"),
         MOVI(temp2, 0), # assume this pixel is off
         ANDI(temp1, curr_font_data, 0x80), # but maybe it's on?
-        BZ("no_pix"), # skip drawing 0 pixels to avoid filling up FIFO
+        BZ("display_ch_row_pix_off"),
          # oh wait it is. ramp color up and down all cool-like
         ANDI(temp2, curr_color, 0xFF),
         ANDI(temp1, curr_color, 0x100),
@@ -193,7 +207,6 @@ def firmware(bpp):
         STX(temp2, curr_fb_ptr, 0), # word 0 is red
         STX(temp2, curr_fb_ptr, 1), # word 1 is green
         STX(temp2, curr_fb_ptr, 2), # word 2 is blue
-    L("no_pix"),
         # then move to the next pixel
         ADDI(curr_fb_ptr, curr_fb_ptr, 4),
         SLLI(curr_font_data, curr_font_data, 1),
@@ -215,7 +228,7 @@ def firmware(bpp):
     # adding data just consists of appending it to the instruction stream
     fw.append(L("message"))
     for m in "helloworld":
-        fw.append(ord(m)-ord('d'))
+        fw.append(ord(m)-ord('a'))
 
     fw.append(L("fontdata"))
 
@@ -223,9 +236,7 @@ def firmware(bpp):
     # the font bitmap is 6 pixels wide and 8 pixels high. bit 7 is the leftmost
     # bit and bit 2 is the rightmost.
 
-    # we don't have enough free memory to hold a through z, so just store the
-    # character range needed for "hello world".
-    for ch in range(ord('d'), ord('w')+1):
+    for ch in range(ord('a'), ord('z')+1):
         for row in range(8):
             fw.append(tft_font[ch*8+row])
 
