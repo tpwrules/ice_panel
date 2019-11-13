@@ -91,7 +91,6 @@ class SimpleUART(Elaboratable):
         r3_rx_empty = SetReset(m, prefer_set=False, initial=True)
         r3_rx_data = Signal(self.char_bits)
 
-
         # handle the boneless bus.
         read_data = Signal(16) # it expects one cycle of read latency
         m.d.sync += self.o_rdata.eq(read_data)
@@ -147,28 +146,11 @@ class SimpleUART(Elaboratable):
         # transmit data (written in a function to keep locals under control)
         def tx():
             # count out the bits we're sending (including start and stop)
-            bit_ctr = Signal(range(self.char_bits+2))
+            bit_ctr = Signal(range(self.char_bits+2-1))
             # shift out the data bits and stop bit
             out_buf = Signal(self.char_bits+1)
             # count cycles per baud
             baud_ctr = Signal(16)
-
-            # send out a new bit when the state machine requests it
-            send_bit = Signal()
-            with m.If(send_bit):
-                m.d.sync += [
-                    self.o_tx.eq(out_buf[0]),
-                    out_buf.eq(out_buf >> 1),
-                ]
-
-            # automatically count down the time per baud
-            baud_ctr_reset = Signal()
-            baud_ctr_done = Signal()
-            m.d.comb += baud_ctr_done.eq(baud_ctr == 0)
-            with m.If(baud_ctr_reset):
-                m.d.sync += baud_ctr.eq(r0_baud_divisor)
-            with m.Elif(~baud_ctr_done):
-                m.d.sync += baud_ctr.eq(baud_ctr-1)
 
             with m.FSM("IDLE"):
                 with m.State("IDLE"):
@@ -184,37 +166,30 @@ class SimpleUART(Elaboratable):
                             bit_ctr.eq(self.char_bits+2-1),
                             # send the start bit first
                             self.o_tx.eq(0),
+                            # start counting the baud time for the start bit
+                            baud_ctr.eq(r0_baud_divisor),
                             # finally, let it be known that we are sending
                             r0_tx_active.eq(1),
                         ]
-                        # start counting down this baud time
-                        m.d.comb += baud_ctr_reset.eq(1)
-                        m.next = "SEND"
+                        m.next = "SEND" # start sending data bits
 
                 with m.State("SEND"):
-                    # once the baud timer expires, we need to send out a new
-                    # bit.
-                    with m.If(baud_ctr_done):
-                        # are we on the last bit?
-                        with m.If(bit_ctr == 0):
-                            m.d.sync += [
-                                # yes, we are done!
-                                r0_tx_active.eq(0),
-                                # the stop bit leaves the bus idle
-                            ]
+                    m.d.sync += baud_ctr.eq(baud_ctr-1)
+                    with m.If(baud_ctr == 0):
+                        with m.If(bit_ctr == 0): # we just sent the stop bit?
+                            m.d.sync += r0_tx_active.eq(0) # yes, we are done!
+                            # the stop bit leaves the bus idle
                             m.next = "IDLE"
                         with m.Else():
                             # nope. shift out the next one and wait for the
                             # appropriate time.
-                            m.d.comb += [
-                                send_bit.eq(1),
-                                baud_ctr_reset.eq(1),
+                            m.d.sync += [
+                                self.o_tx.eq(out_buf[0]), # bus is LSB first
+                                out_buf.eq(out_buf >> 1),
+                                bit_ctr.eq(bit_ctr-1), # one less bit to go
+                                baud_ctr.eq(r0_baud_divisor),
                             ]
-                            # one less bit to go
-                            m.d.sync += bit_ctr.eq(bit_ctr-1)
                             m.next = "SEND"
-
-        tx()
 
         # receive data (written in a function to keep locals under control)
         def rx():
@@ -230,25 +205,6 @@ class SimpleUART(Elaboratable):
             i_rx = Signal(reset=1)
             rx_sync = FFSynchronizer(self.i_rx, i_rx, reset=1)
             m.submodules.rx_sync = rx_sync
-            # receive a new bit when the state machine requests it
-            receive_bit = Signal()
-            with m.If(receive_bit):
-                # shift bits into the MSB so the first bit ends up at the LSB
-                # once we are done.
-                m.d.sync += in_buf.eq(Cat(in_buf[1:], i_rx))
-
-            # automatically count down the time per baud
-            baud_ctr_reset = Signal()
-            # load half the divisor so we can sample at half bit times
-            baud_ctr_half_reset = Signal()
-            baud_ctr_done = Signal()
-            m.d.comb += baud_ctr_done.eq(baud_ctr == 0)
-            with m.If(baud_ctr_reset):
-                m.d.sync += baud_ctr.eq(r0_baud_divisor)
-            with m.Elif(baud_ctr_half_reset):
-                m.d.sync += baud_ctr.eq(r0_baud_divisor>>1)
-            with m.Elif(~baud_ctr_done):
-                m.d.sync += baud_ctr.eq(baud_ctr-1)
 
             with m.FSM("IDLE"):
                 with m.State("IDLE"):
@@ -266,21 +222,26 @@ class SimpleUART(Elaboratable):
                         # sample and can make sure that rx is still asserted.
                         # we're also then lined up to sample the rest of the
                         # bits in the middle.
-                        m.d.comb += baud_ctr_half_reset.eq(1)
+                        m.d.sync += baud_ctr.eq(r0_baud_divisor>>1)
                         # then just receive the start bit like any other
                         m.next = "RECV"
 
                 with m.State("RECV"):
-                    with m.If(baud_ctr_done):
-                        # sample the bit once it's time
-                        m.d.comb += receive_bit.eq(1)
+                    m.d.sync += baud_ctr.eq(baud_ctr-1)
+                    with m.If(baud_ctr == 0):
+                        # sample the bit once it's time. we shift bits into the
+                        # MSB so the first bit ends up at the LSB once we are
+                        # done.
+                        m.d.sync += in_buf.eq(Cat(in_buf[1:], i_rx))
                         with m.If(bit_ctr == 0): # this is the stop bit?
                             # yes, sample it (this cycle) and finish up next
                             m.next = "FINISH"
                         with m.Else():
-                            # and wait for another
-                            m.d.comb += baud_ctr_reset.eq(1)
-                            m.d.sync += bit_ctr.eq(bit_ctr-1)
+                            # no, wait to receive another bit
+                            m.d.sync += [
+                                baud_ctr.eq(r0_baud_divisor),
+                                bit_ctr.eq(bit_ctr-1),
+                            ]
 
                 with m.State("FINISH"):
                     # make sure that the start bit is 0 and the stop bit is 1,
@@ -305,6 +266,8 @@ class SimpleUART(Elaboratable):
                     # during that time so we won't accidentally start receiving
                     # another bit.
 
+        # define the two engines
+        tx()
         rx()
 
         return m
