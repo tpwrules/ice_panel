@@ -25,26 +25,31 @@ from boneless.arch.opcode import *
 #             n-0: read character, if the RX FIFO is not empty
 
 class SetReset(Elaboratable):
-    def __init__(self, module, prefer_set=True, initial=False):
-        # prefer_set: if True, set takes priority over reset
-        self.prefer_set = prefer_set
+    def __init__(self, parent, *, priority, initial=False):
+        # if both set and reset are asserted on the same cycle, the value
+        # becomes the prioritized state.
+        if priority not in ("set", "reset"):
+            raise ValueError("Priority must be either 'set' or 'reset', "
+                "not '{}'.".format(priority))
+
+        self.priority = priority
 
         self.set = Signal()
         self.reset = Signal()
         self.value = Signal(reset=initial)
 
-        # add ourselves. removes the need for the user to add us.
-        module.submodules += self
+        # avoid the user having to remember to add us
+        parent.submodules += self
 
     def elaborate(self, platform):
         m = Module()
 
-        if self.prefer_set:
+        if self.priority == "set":
             with m.If(self.set):
                 m.d.sync += self.value.eq(1)
             with m.Elif(self.reset):
                 m.d.sync += self.value.eq(0)
-        else:
+        elif self.priority == "reset":
             with m.If(self.reset):
                 m.d.sync += self.value.eq(0)
             with m.Elif(self.set):
@@ -81,14 +86,14 @@ class SimpleUART(Elaboratable):
         r0_tx_active = Signal()
         r0_rx_active = Signal()
 
-        r1_rx_error = SetReset(m, prefer_set=True)
-        r1_tx_overflow = SetReset(m, prefer_set=True)
-        r1_rx_overflow = SetReset(m, prefer_set=True)
+        r1_rx_error = SetReset(m, priority="set")
+        r1_tx_overflow = SetReset(m, priority="set")
+        r1_rx_overflow = SetReset(m, priority="set")
 
-        r2_tx_full = SetReset(m, prefer_set=False)
+        r2_tx_full = SetReset(m, priority="reset")
         r2_tx_data = Signal(self.char_bits)
 
-        r3_rx_empty = SetReset(m, prefer_set=False, initial=True)
+        r3_rx_empty = SetReset(m, priority="reset", initial=True)
         r3_rx_data = Signal(self.char_bits)
 
         # handle the boneless bus.
@@ -114,8 +119,8 @@ class SimpleUART(Elaboratable):
                     # we don't really have a FIFO, just a buffer register and an
                     # input shift register. so do FIFO-type logic here.
                     m.d.comb += read_data[15].eq(r3_rx_empty.value)
-                    # even if the buffer is "empty", there's still bits there.
-                    # read them out so we don't have to have another mux.
+                    # even if the buffer is "empty", the contents are still
+                    # defined. read them out so we don't have to have a mux.
                     m.d.comb += read_data[:self.char_bits].eq(r3_rx_data)
                     # and since we have read the only thing out of the buffer,
                     # it's now empty
