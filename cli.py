@@ -34,10 +34,15 @@ def main_parser(parser=None):
     p_build.add_argument("-p", "--program", action="store_true",
         help="program the platform with the built design")
 
+    p_boneload = p_action.add_parser(
+        "boneload", help="boneload design firmware into device")
+    p_boneload.add_argument("-p", "--port", type=str, required=True,
+        help="serial port to program over")
+
     return parser
 
 
-def main_runner(parser, args, maker, ports=(), build_args={}):
+def main_runner(parser, args, maker, fw=None, ports=(), build_args={}):
     if args.action == "simulate":
         design, platform = maker(simulating=True)
         fragment = Fragment.get(design, platform)
@@ -51,6 +56,10 @@ def main_runner(parser, args, maker, ports=(), build_args={}):
     if args.action == "build":
         design, platform = maker(simulating=False)
         platform.build(design, do_program=args.program, **build_args)
+
+    if args.action == "boneload":
+        import boneload
+        boneload.boneload(fw(), args.port)
 
 def main(*args, **kwargs):
     parser = main_parser()

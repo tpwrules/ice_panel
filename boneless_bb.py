@@ -6,6 +6,8 @@ from boneless.gateware import ALSRU_4LUT, CoreFSM
 from boneless.arch.opcode import Instr
 from boneless.arch.opcode import *
 
+import boneload
+
 import pmod_resources
 from hub75 import PanelDescription, GammaParameters, FramebufferedHUB75Driver
 from pll import PLL
@@ -21,10 +23,11 @@ class BonelessLED(Elaboratable):
         self.panel = FramebufferedHUB75Driver(self.pd, led_domain=led_domain,
            gamma_params=self.gp)
 
-        self.cpu_rom = Memory(width=16, depth=512,
-            init=Instr.assemble(firmware(self.gp.bpp)))
+        self.cpu_rom = Memory(width=16, depth=256,
+            init=boneload.boneload_fw(uart_addr=0))
         self.cpu_ram = SPRAM()
-        self.cpu_core = CoreFSM(alsru_cls=ALSRU_4LUT)
+        self.cpu_core = CoreFSM(alsru_cls=ALSRU_4LUT,
+            reset_pc=0xFF00, reset_w=0xFFF8)
 
         self.uart = uart.SimpleUART(
             default_divisor=uart.calculate_divisor(12e6, 115200))
@@ -47,8 +50,8 @@ class BonelessLED(Elaboratable):
         rom_en = Signal()
         ram_en = Signal()
         m.d.comb += [
-            rom_en.eq(cpu_core.o_bus_addr[-1] == 0),
-            ram_en.eq(cpu_core.o_bus_addr[-1] == 1),
+            rom_en.eq(cpu_core.o_bus_addr[-1] == 1),
+            ram_en.eq(cpu_core.o_bus_addr[-1] == 0),
         ]
         # we need to know who was enabled one cycle later so we can route the
         # read result back correctly.
@@ -337,4 +340,7 @@ if __name__ == "__main__":
         platform = ICEBreakerPlatform()
         return design, platform
 
-    main(maker=make, build_args={"synth_opts": "-abc9"})
+    def fw():
+        return firmware(8)
+
+    main(maker=make, fw=fw, build_args={"synth_opts": "-abc9"})

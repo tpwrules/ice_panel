@@ -87,6 +87,12 @@
 #   parameter words: the words
 #   purpose: give back the read words
 
+# result 4: identify
+#   length: 3
+#   parameter words: boot version (currently 1), board id, max length
+#   purpose: say stuff about ourselves
+
+from boneless.gateware import ALSRU_4LUT, CoreFSM
 from boneless.arch.opcode import Instr
 from boneless.arch.opcode import *
 import serial
@@ -106,6 +112,7 @@ def _bfw_calc_crc():
     curr_addr = R5
     end_addr = R4
     bit_ctr = R3
+    old_crc = R1
     crc = R0
     return [
         # set up register frame and load parameters
@@ -118,9 +125,9 @@ def _bfw_calc_crc():
         XOR(crc, crc, bit_ctr), # mix new bits into CRC
         MOVI(bit_ctr, 16),
     L(lp+"bits"), # update CRC for every bit in the word
-        MOV(temp1, crc), # copy so we can query lowest bit
+        MOV(old_crc, crc), # copy so we can query lowest bit
         SRLI(crc, crc, 1),
-        ANDI(temp1, temp1, 1), # was lowest bit set?
+        ANDI(old_crc, old_crc, 1), # was lowest bit set?
         BNE(lp+"nope"),
         XORI(crc, crc, 0x8408), # yes, XOR in polynomial
     L(lp+"nope"),
@@ -132,7 +139,7 @@ def _bfw_calc_crc():
 
         # take down register frame and return
         ADJW(8),
-        JR(R7), # R7 in caller's window
+        JR(R7, 0), # R7 in caller's window
     ]
 
 # receive one byte from the UART with constant timeout (in ms, approx)
@@ -141,7 +148,7 @@ def _bfw_calc_crc():
 # on exit (in our window):
 # R0: gotten byte ROR 1 (or 14th bit set + junk if timeout)
 def _bfw_rx_byte(uart_addr, timeout=500):
-    timeout = (12e6*(500/1e3))//(4*6) # 6 insns at ~4 cycles per insn
+    timeout = int((12e6*(500/1e3))//(4*6)) # 6 insns at ~4 cycles per insn
     # generate random prefix so that we effectively can make local labels
     lp = "_{}_".format(random.randrange(2**32))
     timeout_ctr_hi = R5
@@ -175,15 +182,15 @@ def _bfw_rx_byte(uart_addr, timeout=500):
         # byte is already where it needs to be, so take down register frame and
         # return
         ADJW(8),
-        JR(R7), # R7 in caller's window
+        JR(R7, 0), # R7 in caller's window
     ]
 
 # receive a packet
 # on entry (in caller window):
 # R7: return address
 # on exit (in our window):
-# R0: issues: 0 = ok, 1 = timeout, 2 = bad CRC, 3 = bad length
-def _bfw_rx_packet():
+# R0: issues: 0 = ok, 1 = bad length, 2 = bad CRC, 3 = timeout
+def _bfw_rx_packet(max_length):
     # generate random prefix so that we effectively can make local labels
     lp = "_{}_".format(random.randrange(2**32))
     return_addr = R7
@@ -201,10 +208,10 @@ def _bfw_rx_packet():
         MOVI(issues, 0),
         # secretly the command word is two bytes!
         # receive the length byte first
-        JR(temp1, "rx_or_timeout"),
+        JAL(temp1, lp+"rx_or_timeout"),
         MOV(length, temp2),
         # then get the command byte
-        JR(temp1, "rx_or_timeout"),
+        JAL(temp1, lp+"rx_or_timeout"),
         # and reform the command word
         SLLI(temp2, temp2, 8),
         ORI(length, length, temp2),
@@ -216,17 +223,17 @@ def _bfw_rx_packet():
         CMPI(length, max_length+1),
         BLEU(lp+"goodlength"),
         # it's too long! we would overflow something.
-        MOVI(issues, 3),
+        MOVI(issues, 1),
         J(lp+"ret"),
     L(lp+"goodlength"),
         # now we can start receiving the words
         MOVI(buf_pos, 0),
     L(lp+"rx_words"),
         # get low half
-        JR(temp1, "rx_or_timeout"),
+        JAL(temp1, lp+"rx_or_timeout"),
         MOV(got_word, temp2),
         # then high half
-        JR(temp1, "rx_or_timeout"),
+        JAL(temp1, lp+"rx_or_timeout"),
         SLLI(temp2, temp2, 8),
         ORI(got_word, got_word, temp2),
         # and store to the buffer
@@ -240,7 +247,7 @@ def _bfw_rx_packet():
         # then calculate what the buffer's CRC actually is
         MOVR(R5, "pb_cmdresp"),
         ADDI(R4, R5, length),
-        JR(return_addr, "calc_crc"),
+        JAL(return_addr, "calc_crc"),
         # and compare it with what it should be
         LD(temp2, frame_ptr, -16+0),
         CMP(temp1, temp2),
@@ -249,32 +256,168 @@ def _bfw_rx_packet():
         MOVI(issues, 2),
     L(lp+"ret"),
         ADJW(8),
-        JR(R7), # R7 in caller's window
+        JR(R7, 0), # R7 in caller's window
     L(lp+"rx_or_timeout"),
-        JR(return_addr, "rx_byte"),
+        JAL(return_addr, "rx_byte"),
         LD(temp2, frame_ptr, -16+0),
         ROLI(temp2, temp2, 1),
         BS1(lp+"timedout"),
-        JR(temp1),
+        JR(temp1, 0),
     L(lp+"timedout"),
-        MOVI(issues, 1),
+        MOVI(issues, 3),
         J(lp+"ret"),
+    ]
+
+# transmit a packet
+# on entry (in caller window):
+# R7: return address
+# R5: packet length (excluding CRC and result word)
+# R4: result code
+# on exit (in our window):
+# nothing of significance
+def _bfw_tx_packet(uart_addr):
+    # generate random prefix so that we effectively can make local labels
+    lp = "_{}_".format(random.randrange(2**32))
+    return_addr = R7
+    frame_ptr = R6
+    result = R4
+    length = R3
+    crc = R2
+    temp1 = R1
+    buf_ptr = R0
+    return [
+        # create register frame and load parameters
+        LDW(frame_ptr, -8),
+        LD(length, frame_ptr, 5),
+        LD(result, frame_ptr, 4),
+
+        # pack up the result word
+        SLLI(temp1, result, 8),
+        OR(temp1, length, length),
+        MOVI(crc, 0),
+        # and store it to the buffer
+        STR(temp1, crc, "pb_cmdresp"),
+
+        ADDI(length, length, 1), # bump length to include response word
+        # calculate CRC of the packet
+        MOVR(R5, "pb_cmdresp"),
+        ADD(R4, R5, length),
+        JAL(R7, "calc_crc"),
+        LD(crc, frame_ptr, -16+0),
+        # and store it at the end of the buffer
+        ADDI(length, length, 1), # bump length to include CRC
+        ST(crc, length, "pb_cmdresp"),
+
+        # actually transmit the packet
+        MOVR(buf_ptr, "pb_cmdresp"),
+        ADD(length, length, buf_ptr),
+        # use 'crc' as temp variable for what to send
+    L(lp+"tx"),
+        LD(crc, buf_ptr, 0), # get this word from the buffer
+        JAL(R7, lp+"tx_byte"), # transmit the low byte
+        SRLI(crc, crc, 8), # get high byte of word
+        JAL(R7, lp+"tx_byte"), # and send it
+        ADDI(buf_ptr, buf_ptr, 1),
+        CMP(buf_ptr, length), # done with the buffer?
+        BNE(lp+"tx"),
+        ADJW(8),
+        JR(R7, 0), # R7 in caller's window
+
+    L(lp+"tx_byte"),
+        # wait until the transmit fifo has space
+        LDXA(temp1, uart_addr+2),
+        ANDI(temp1, temp1, 1),
+        BZ0(lp+"tx_byte"),
+        # then send the byte
+        ANDI(temp1, crc, 0xFF),
+        STXA(temp1, uart_addr+2),
+        JR(R7, 0),
     ]
 
 def _bfw_main(uart_addr):
     max_length = 16 # adjust to fill memory
     fw = []
 
+    our_window = 0xFFF8 # W when chip is reset
+
+    # PACKET RECEIVE SECTION
+    return_addr = R7
+    result = R6
+    command = R5
+    temp1 = R4
+    temp2 = R3
+    temp3 = R2
+    fw.append([
+    L("sys_packet_rx"),
+        # get a new packet from whatever's bootloading us
+        JAL(return_addr, "rx_packet"),
+        MOVI(result, our_window),
+        LD(result, result, -8+0),
+        AND(result, result, result), # if nonzero, there was an issue
+        BNZ("sys_packet_tx_issue"),
+        # otherwise, dispatch the command
+        # a switch table would be nice, but we can't actually declare one yet
+        LDR(command, result, "pb_cmdresp"), # (we know result = 0)
+        CMPI(command, 0),
+        BEQ("sys_cmd_identify"),
+        # oh no, we don't know what the command is
+        # fortunately, a result of 0 also = bad command
+        # so just fall through to sending a problem packet
+    L("sys_packet_tx_issue"), # send error packet with problem in result
+        # store the problem in the packet
+        MOVI(temp1, 0),
+        STR(result, temp1, "pb_data"),
+        # result code 1 with length 1
+        MOVI(R4, 1),
+        MOVI(R5, 1),
+        JAL(return_addr, "tx_packet"),
+        J("sys_packet_rx"), # do it all again
+    L("sys_packet_tx_success"), # say everything went great
+        # result code 0 with length 0
+        MOVI(R4, 0),
+        MOVI(R5, 0),
+        JAL(return_addr, "tx_packet"),
+        J("sys_packet_rx"), # do it all again
+
+    L("sys_cmd_identify"),
+        # write identification data to buffer
+        MOVR(temp1, "pb_data"),
+        MOVI(temp2, 1), # boot version
+        ST(temp2, temp1, 0),
+        MOVI(temp2, 0x69), # board id
+        ST(temp2, temp1, 1),
+        MOVI(temp2, max_length), # max packet len
+        ST(temp2, temp1, 1),
+        # result code 4 with length 3
+        MOVI(R4, 4),
+        MOVI(R5, 3),
+        JAL(return_addr, "tx_packet"),
+        J("sys_packet_rx"),
+    ])
+
+    fw.append([ # declare subroutines
+    L("calc_crc"),
+        _bfw_calc_crc(),
+    L("rx_byte"),
+        _bfw_rx_byte(uart_addr),
+    L("rx_packet"),
+        _bfw_rx_packet(max_length),
+    L("tx_packet"),
+        _bfw_tx_packet(uart_addr),
+    ])
+
     # set up labels for packet buffer and reserve space so that we ensure we
     # don't overwrite something else while using it.
     fw.append([
-    L("pb_cmdresp"), 0
+    L("pb_cmdresp"), 0,
     L("pb_data"), [0]*(max_length+1), # account for CRC word
     ])
 
     # reserve 3 register windows so we can call subroutines and be sure we won't
     # hit something below.
     fw.append([0]*(3*8))
+
+    return fw
 
 def boneload_fw(uart_addr=0):
     return Instr.assemble(_bfw_main(uart_addr))
@@ -306,6 +449,19 @@ class BadCRC(BLError):
         return "Bad CRC: expected 0x{:04X} but received 0x{:04X}".format(
             self.expected, self.received)
 
+class Timeout(BLError): pass
+
+def ser_read(ser, length):
+    read = b""
+    while length > 0:
+        new = ser.read(length)
+        if new == 0:
+            raise Timeout("read timeout")
+        read += new
+        length -= len(new)
+    print(read)
+
+    return read
 
 # send the given command words, then receive the response words (and check CRC)
 def _bl_transact(ser, command):
@@ -314,11 +470,11 @@ def _bl_transact(ser, command):
 
     response = []
     # secretly the first word is two bytes
-    length = ser.read(1)
-    length = 2*int(length)+2 # *2 for words, +2 for CRC word
-    response.append(int(ser.read(1))<<8 + length)
+    length = ser_read(ser, 1)
+    length = 2*int(length[0])+2 # *2 for words, +2 for CRC word
+    response.append(int(ser_read(ser, 1)[0])<<8 + length)
     for wi in range(length):
-        response.append(int.from_bytes(ser.read(2), byteorder="little"))
+        response.append(int.from_bytes(ser_read(ser, 2), byteorder="little"))
 
     crc = _crc(response[:-1])
     if crc != response[-1]:
@@ -354,11 +510,14 @@ def _bl_identify(ser):
 def boneload(firmware, port):
     import serial
     print("Connecting...")
-    ser = serial.Serial(port, 115200, timeout=0.1)
+    ser = serial.Serial(port, 115200, timeout=1)
     print("Identifying (reset board please)...")
     while True:
         try:
-            print(_bl_identify())
+            print(_bl_identify(ser))
             break
-        except serial.timeout:
+        except Timeout:
             pass
+
+if __name__ == "__main__":
+    print(len(boneload_fw()))
