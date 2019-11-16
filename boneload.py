@@ -128,7 +128,7 @@ def _bfw_calc_crc():
         MOV(old_crc, crc), # copy so we can query lowest bit
         SRLI(crc, crc, 1),
         ANDI(old_crc, old_crc, 1), # was lowest bit set?
-        BNE(lp+"nope"),
+        BZ1(lp+"nope"),
         XORI(crc, crc, 0x8408), # yes, XOR in polynomial
     L(lp+"nope"),
         SUBI(bit_ctr, bit_ctr, 1),
@@ -214,7 +214,7 @@ def _bfw_rx_packet(max_length):
         JAL(temp1, lp+"rx_or_timeout"),
         # and reform the command word
         SLLI(temp2, temp2, 8),
-        ORI(length, length, temp2),
+        OR(length, length, temp2),
         STR(length, issues, "pb_cmdresp"), # issues = 0
         # now get the actual length back
         ANDI(length, length, 0xFF),
@@ -235,7 +235,7 @@ def _bfw_rx_packet(max_length):
         # then high half
         JAL(temp1, lp+"rx_or_timeout"),
         SLLI(temp2, temp2, 8),
-        ORI(got_word, got_word, temp2),
+        OR(got_word, got_word, temp2),
         # and store to the buffer
         STR(got_word, buf_pos, "pb_data"),
         ADDI(buf_pos, buf_pos, 1),
@@ -246,7 +246,7 @@ def _bfw_rx_packet(max_length):
         LDR(temp1, length, "pb_cmdresp"),
         # then calculate what the buffer's CRC actually is
         MOVR(R5, "pb_cmdresp"),
-        ADDI(R4, R5, length),
+        ADD(R4, R5, length),
         JAL(return_addr, "calc_crc"),
         # and compare it with what it should be
         LD(temp2, frame_ptr, -16+0),
@@ -293,7 +293,7 @@ def _bfw_tx_packet(uart_addr):
 
         # pack up the result word
         SLLI(temp1, result, 8),
-        OR(temp1, length, length),
+        OR(temp1, temp1, length),
         MOVI(crc, 0),
         # and store it to the buffer
         STR(temp1, crc, "pb_cmdresp"),
@@ -305,11 +305,11 @@ def _bfw_tx_packet(uart_addr):
         JAL(R7, "calc_crc"),
         LD(crc, frame_ptr, -16+0),
         # and store it at the end of the buffer
-        ADDI(length, length, 1), # bump length to include CRC
-        ST(crc, length, "pb_cmdresp"),
+        STR(crc, length, "pb_cmdresp"),
 
         # actually transmit the packet
         MOVR(buf_ptr, "pb_cmdresp"),
+        ADDI(length, length, 1), # bump length to include CRC
         ADD(length, length, buf_ptr),
         # use 'crc' as temp variable for what to send
     L(lp+"tx"),
@@ -459,8 +459,6 @@ def ser_read(ser, length):
             raise Timeout("read timeout")
         read += new
         length -= len(new)
-    print(read)
-
     return read
 
 # send the given command words, then receive the response words (and check CRC)
@@ -470,9 +468,9 @@ def _bl_transact(ser, command):
 
     response = []
     # secretly the first word is two bytes
-    length = ser_read(ser, 1)
-    length = 2*int(length[0])+2 # *2 for words, +2 for CRC word
-    response.append(int(ser_read(ser, 1)[0])<<8 + length)
+    length = ser_read(ser, 1)[0]
+    response.append((ser_read(ser, 1)[0]<<8) + length)
+    length += 1 # include CRC word
     for wi in range(length):
         response.append(int.from_bytes(ser_read(ser, 2), byteorder="little"))
 
@@ -510,7 +508,7 @@ def _bl_identify(ser):
 def boneload(firmware, port):
     import serial
     print("Connecting...")
-    ser = serial.Serial(port, 115200, timeout=1)
+    ser = serial.Serial(port, 115200, timeout=0.1)
     print("Identifying (reset board please)...")
     while True:
         try:
