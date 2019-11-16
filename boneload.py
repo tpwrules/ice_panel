@@ -109,13 +109,13 @@ import random
 def _bfw_calc_crc():
     # generate random prefix so that we effectively can make local labels
     lp = "_{}_".format(random.randrange(2**32))
-    r = RegisterManager("R6:frame_ptr R5:curr_addr R4:end_addr R3:bit_ctr "
+    r = RegisterManager("R6:fp R5:curr_addr R4:end_addr R3:bit_ctr "
         "R2:new_word R1:old_crc R0:crc")
     return [
         # set up register frame and load parameters
-        LDW(r.frame_ptr, -8),
-        LD(r.curr_addr, r.frame_ptr, 5),
-        LD(r.end_addr, r.frame_ptr, 4),
+        LDW(r.fp, -8),
+        LD(r.curr_addr, r.fp, 5),
+        LD(r.end_addr, r.fp, 4),
         MOVI(r.crc, 0),
     L(lp+"words"),
         LD(r.new_word, r.curr_addr, 0),
@@ -148,29 +148,27 @@ def _bfw_rx_byte(uart_addr, timeout=500):
     timeout = int((12e6*(500/1e3))//(4*6)) # 6 insns at ~4 cycles per insn
     # generate random prefix so that we effectively can make local labels
     lp = "_{}_".format(random.randrange(2**32))
-    timeout_ctr_hi = R5
-    timeout_ctr_lo = R4
-    temp1 = R3
-    got_byte = R0
+    r = RegisterManager("R5:timeout_ctr_hi R4:timeout_ctr_lo "
+        "R3:junk R0:got_byte")
     return [
         # create register frame. we don't need a frame pointer since we don't
         # have any parameters.
         ADJW(-8),
 
         # set up time counters with precalculated duration
-        MOVI(timeout_ctr_hi, (timeout>>16)+1),
-        MOVI(timeout_ctr_lo, timeout&0xFFFF),
+        MOVI(r.timeout_ctr_hi, (timeout>>16)+1),
+        MOVI(r.timeout_ctr_lo, timeout&0xFFFF),
     L(lp+"rx"),
         # get potential byte from the peripheral
-        LDXA(got_byte, uart_addr+3),
+        LDXA(r.got_byte, uart_addr+3),
         # make sure we've got a real byte
         # (but don't return the rotated version; we want our caller to be able
         # to check the same way!)
-        ROLI(temp1, got_byte, 1),
+        ROLI(r.junk, r.got_byte, 1),
         BS0(lp+"done"), # and we can return with it
         # otherwise, count down the timeout
-        SUBI(timeout_ctr_lo, timeout_ctr_lo, 1),
-        SBCI(timeout_ctr_hi, timeout_ctr_hi, 0),
+        SUBI(r.timeout_ctr_lo, r.timeout_ctr_lo, 1),
+        SBCI(r.timeout_ctr_hi, r.timeout_ctr_hi, 0),
         # if the high half reached zero, the timeout is over. but the got byte
         # already has the appropriate bit set since we just read the peripheral.
         # so we can just fall through and return.
@@ -190,78 +188,72 @@ def _bfw_rx_byte(uart_addr, timeout=500):
 def _bfw_rx_packet(max_length):
     # generate random prefix so that we effectively can make local labels
     lp = "_{}_".format(random.randrange(2**32))
-    return_addr = R7
-    frame_ptr = R6
-    buf_pos = R5
-    got_word = R4
-    temp1 = R3
-    temp2 = R2
-    length = R1
-    issues = R0
+    r = RegisterManager("R7:lr R6:fp "
+        "R5:buf_pos R4:got_word R3:temp1 R2:temp2 R1:length R0:issues")
     return [
         # create register frame (we need the pointer to access return values)
-        LDW(frame_ptr, -8),
+        LDW(r.fp, -8),
 
-        MOVI(issues, 0),
+        MOVI(r.issues, 0),
         # secretly the command word is two bytes!
         # receive the length byte first
-        JAL(temp1, lp+"rx_or_timeout"),
-        MOV(length, temp2),
+        JAL(r.temp1, lp+"rx_or_timeout"),
+        MOV(r.length, r.temp2),
         # then get the command byte
-        JAL(temp1, lp+"rx_or_timeout"),
+        JAL(r.temp1, lp+"rx_or_timeout"),
         # and reform the command word
-        SLLI(temp2, temp2, 8),
-        OR(length, length, temp2),
-        STR(length, issues, "pb_cmdresp"), # issues = 0
+        SLLI(r.temp2, r.temp2, 8),
+        OR(r.length, r.length, r.temp2),
+        STR(r.length, r.issues, "pb_cmdresp"), # issues = 0
         # now get the actual length back
-        ANDI(length, length, 0xFF),
-        ADDI(length, length, 1), # add 1 to account for CRC word
+        ANDI(r.length, r.length, 0xFF),
+        ADDI(r.length, r.length, 1), # add 1 to account for CRC word
         # make sure we can actually fit the length
-        CMPI(length, max_length+1),
+        CMPI(r.length, max_length+1),
         BLEU(lp+"goodlength"),
         # it's too long! we would overflow something.
-        MOVI(issues, 1),
+        MOVI(r.issues, 1),
         J(lp+"ret"),
     L(lp+"goodlength"),
         # now we can start receiving the words
-        MOVI(buf_pos, 0),
+        MOVI(r.buf_pos, 0),
     L(lp+"rx_words"),
         # get low half
-        JAL(temp1, lp+"rx_or_timeout"),
-        MOV(got_word, temp2),
+        JAL(r.temp1, lp+"rx_or_timeout"),
+        MOV(r.got_word, r.temp2),
         # then high half
-        JAL(temp1, lp+"rx_or_timeout"),
-        SLLI(temp2, temp2, 8),
-        OR(got_word, got_word, temp2),
+        JAL(r.temp1, lp+"rx_or_timeout"),
+        SLLI(r.temp2, r.temp2, 8),
+        OR(r.got_word, r.got_word, r.temp2),
         # and store to the buffer
-        STR(got_word, buf_pos, "pb_data"),
-        ADDI(buf_pos, buf_pos, 1),
-        CMP(buf_pos, length),
+        STR(r.got_word, r.buf_pos, "pb_data"),
+        ADDI(r.buf_pos, r.buf_pos, 1),
+        CMP(r.buf_pos, r.length),
         BNE(lp+"rx_words"),
 
         # get CRC out of buffer
-        LDR(temp1, length, "pb_cmdresp"),
+        LDR(r.temp1, r.length, "pb_cmdresp"),
         # then calculate what the buffer's CRC actually is
         MOVR(R5, "pb_cmdresp"),
-        ADD(R4, R5, length),
-        JAL(return_addr, "calc_crc"),
+        ADD(R4, R5, r.length),
+        JAL(r.lr, "calc_crc"),
         # and compare it with what it should be
-        LD(temp2, frame_ptr, -16+0),
-        CMP(temp1, temp2),
+        LD(r.temp2, r.fp, -16+0),
+        CMP(r.temp1, r.temp2),
         BEQ(lp+"ret"),
         # if they don't match, signal CRC error
-        MOVI(issues, 2),
+        MOVI(r.issues, 2),
     L(lp+"ret"),
         ADJW(8),
         JR(R7, 0), # R7 in caller's window
     L(lp+"rx_or_timeout"),
-        JAL(return_addr, "rx_byte"),
-        LD(temp2, frame_ptr, -16+0),
-        ROLI(temp2, temp2, 1),
+        JAL(r.lr, "rx_byte"),
+        LD(r.temp2, r.fp, -16+0),
+        ROLI(r.temp2, r.temp2, 1),
         BS1(lp+"timedout"),
-        JR(temp1, 0),
+        JR(r.temp1, 0),
     L(lp+"timedout"),
-        MOVI(issues, 3),
+        MOVI(r.issues, 3),
         J(lp+"ret"),
     ]
 
@@ -275,59 +267,54 @@ def _bfw_rx_packet(max_length):
 def _bfw_tx_packet(uart_addr):
     # generate random prefix so that we effectively can make local labels
     lp = "_{}_".format(random.randrange(2**32))
-    return_addr = R7
-    frame_ptr = R6
-    result = R4
-    length = R3
-    crc = R2
-    temp1 = R1
-    buf_ptr = R0
+    r = RegisterManager("R7:lr R6:fp "
+        "R4:result R3:length R2:crc R1:temp1 R0:buf_ptr")
     return [
         # create register frame and load parameters
-        LDW(frame_ptr, -8),
-        LD(length, frame_ptr, 5),
-        LD(result, frame_ptr, 4),
+        LDW(r.fp, -8),
+        LD(r.length, r.fp, 5),
+        LD(r.result, r.fp, 4),
 
         # pack up the result word
-        SLLI(temp1, result, 8),
-        OR(temp1, temp1, length),
-        MOVI(crc, 0),
+        SLLI(r.temp1, r.result, 8),
+        OR(r.temp1, r.temp1, r.length),
+        MOVI(r.crc, 0),
         # and store it to the buffer
-        STR(temp1, crc, "pb_cmdresp"),
+        STR(r.temp1, r.crc, "pb_cmdresp"),
 
-        ADDI(length, length, 1), # bump length to include response word
+        ADDI(r.length, r.length, 1), # bump length to include response word
         # calculate CRC of the packet
         MOVR(R5, "pb_cmdresp"),
-        ADD(R4, R5, length),
+        ADD(R4, R5, r.length),
         JAL(R7, "calc_crc"),
-        LD(crc, frame_ptr, -16+0),
+        LD(r.crc, r.fp, -16+0),
         # and store it at the end of the buffer
-        STR(crc, length, "pb_cmdresp"),
+        STR(r.crc, r.length, "pb_cmdresp"),
 
         # actually transmit the packet
-        MOVR(buf_ptr, "pb_cmdresp"),
-        ADDI(length, length, 1), # bump length to include CRC
-        ADD(length, length, buf_ptr),
+        MOVR(r.buf_ptr, "pb_cmdresp"),
+        ADDI(r.length, r.length, 1), # bump length to include CRC
+        ADD(r.length, r.length, r.buf_ptr),
         # use 'crc' as temp variable for what to send
     L(lp+"tx"),
-        LD(crc, buf_ptr, 0), # get this word from the buffer
+        LD(r.crc, r.buf_ptr, 0), # get this word from the buffer
         JAL(R7, lp+"tx_byte"), # transmit the low byte
-        SRLI(crc, crc, 8), # get high byte of word
+        SRLI(r.crc, r.crc, 8), # get high byte of word
         JAL(R7, lp+"tx_byte"), # and send it
-        ADDI(buf_ptr, buf_ptr, 1),
-        CMP(buf_ptr, length), # done with the buffer?
+        ADDI(r.buf_ptr, r.buf_ptr, 1),
+        CMP(r.buf_ptr, r.length), # done with the buffer?
         BNE(lp+"tx"),
         ADJW(8),
         JR(R7, 0), # R7 in caller's window
 
     L(lp+"tx_byte"),
         # wait until the transmit fifo has space
-        LDXA(temp1, uart_addr+2),
-        ANDI(temp1, temp1, 1),
+        LDXA(r.temp1, uart_addr+2),
+        ANDI(r.temp1, r.temp1, 1),
         BZ0(lp+"tx_byte"),
         # then send the byte
-        ANDI(temp1, crc, 0xFF),
-        STXA(temp1, uart_addr+2),
+        ANDI(r.temp1, r.crc, 0xFF),
+        STXA(r.temp1, uart_addr+2),
         JR(R7, 0),
     ]
 
@@ -338,93 +325,88 @@ def _bfw_main(uart_addr):
     our_window = 0xFFF8 # W when chip is reset
 
     # PACKET RECEIVE SECTION
-    return_addr = R7
-    result = R6
-    command = R5
-    temp1 = R4
-    temp2 = R3
-    temp3 = R2
-    temp4 = R1
+    r = RegisterManager("R7:lr R6:fp "
+        "R5:command R4:temp1 R3:temp2 R2:temp3 R1:temp4 R0:result")
     fw.append([
     L("sys_packet_rx"),
+        MOVI(r.fp, our_window),
         # get a new packet from whatever's bootloading us
-        JAL(return_addr, "rx_packet"),
-        MOVI(result, our_window),
-        LD(result, result, -8+0),
-        AND(result, result, result), # if nonzero, there was an issue
+        JAL(r.lr, "rx_packet"),
+        LD(r.result, r.fp, -8+0),
+        AND(r.result, r.result, r.result), # if nonzero, there was an issue
         BNZ("sys_packet_tx_issue"),
         # otherwise, dispatch the command
         # a switch table would be nice, but we can't actually declare one yet
-        LDR(command, result, "pb_cmdresp"), # (we know result = 0)
-        SRLI(command, command, 8),
-        CMPI(command, 1),
+        LDR(r.command, r.result, "pb_cmdresp"), # (we know result = 0)
+        SRLI(r.command, r.command, 8),
+        CMPI(r.command, 1),
         BEQ("sys_cmd_identify"),
-        CMPI(command, 2),
+        CMPI(r.command, 2),
         BEQ("sys_cmd_write_data"),
-        CMPI(command, 4),
+        CMPI(r.command, 4),
         BEQ("sys_cmd_jump_to_code"),
         # oh no, we don't know what the command is
         # fortunately, a result of 0 also = bad command
         # so just fall through to sending a problem packet
     L("sys_packet_tx_issue"), # send error packet with problem in result
         # store the problem in the packet
-        MOVI(temp1, 0),
-        STR(result, temp1, "pb_data"),
+        MOVI(r.temp1, 0),
+        STR(r.result, r.temp1, "pb_data"),
         # result code 2 with length 1
         MOVI(R4, 2),
         MOVI(R5, 1),
-        JAL(return_addr, "tx_packet"),
+        JAL(r.lr, "tx_packet"),
         J("sys_packet_rx"), # do it all again
     L("sys_packet_tx_success"), # say everything went great
         # result code 1 with length 0
         MOVI(R4, 1),
         MOVI(R5, 0),
-        JAL(return_addr, "tx_packet"),
+        JAL(r.lr, "tx_packet"),
         J("sys_packet_rx"), # do it all again
 
     L("sys_cmd_identify"),
         # write identification data to buffer
-        MOVR(temp1, "pb_data"),
-        MOVI(temp2, 1), # boot version
-        ST(temp2, temp1, 0),
-        MOVI(temp2, 0x69), # board id
-        ST(temp2, temp1, 1),
-        MOVI(temp2, max_length), # max packet len
-        ST(temp2, temp1, 2),
+        MOVR(r.temp1, "pb_data"),
+        MOVI(r.temp2, 1), # boot version
+        ST(r.temp2, r.temp1, 0),
+        MOVI(r.temp2, 0x69), # board id
+        ST(r.temp2, r.temp1, 1),
+        MOVI(r.temp2, max_length), # max packet len
+        ST(r.temp2, r.temp1, 2),
         # result code 5 with length 3
         MOVI(R4, 5),
         MOVI(R5, 3),
-        JAL(return_addr, "tx_packet"),
+        JAL(r.lr, "tx_packet"),
         J("sys_packet_rx"),
 
     L("sys_cmd_write_data"),
         # write some data to some address
         # TODO validate length
-        MOVR(temp1, "pb_data"),
-        LD(temp2, temp1, 0), # dest addr
-        LD(temp3, temp1, -1), # command/length
-        ANDI(temp3, temp3, 0xFF),
-        MOVI(temp1, 1), # current pos
+        MOVR(r.temp1, "pb_data"),
+        LD(r.temp2, r.temp1, 0), # dest addr
+        LD(r.temp3, r.temp1, -1), # command/length
+        ANDI(r.temp3, r.temp3, 0xFF),
+        MOVI(r.temp1, 1), # current pos
     L("_scwd_copy"),
-        LDR(temp4, temp1, "pb_data"),
-        ST(temp4, temp2, 0),
-        ADDI(temp2, temp2, 1),
-        ADDI(temp1, temp1, 1),
-        CMP(temp1, temp3),
+        LDR(r.temp4, r.temp1, "pb_data"),
+        ST(r.temp4, r.temp2, 0),
+        ADDI(r.temp2, r.temp2, 1),
+        ADDI(r.temp1, r.temp1, 1),
+        CMP(r.temp1, r.temp3),
         BNE("_scwd_copy"),
         J("sys_packet_tx_success"),
 
     L("sys_cmd_jump_to_code"),
         # jump to some downloaded code
         # TODO validate length
-        MOVR(temp1, "pb_data"),
-        LD(R0, temp1, 0), # dest addr
-        LD(R1, temp1, 1), # dest W
+        MOVR(r.temp1, "pb_data"),
+        LD(R0, r.temp1, 0), # dest addr
+        LD(R1, r.temp1, 1), # dest W
         # tell the host that we successfully got everything before we jump into
         # the app code
         MOVI(R4, 1),
         MOVI(R5, 0),
-        JAL(return_addr, "tx_packet"),
+        JAL(r.lr, "tx_packet"),
         XCHW(R7, R1), # set new W and store current one
         LD(R7, R7, 0), # get jump destination
         JR(R7, 0), # and jump to it
