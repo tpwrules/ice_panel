@@ -9,6 +9,7 @@ from boneless.arch.opcode import *
 import pmod_resources
 from hub75 import PanelDescription, GammaParameters, FramebufferedHUB75Driver
 from pll import PLL
+from spram import SPRAM
 import uart
 
 
@@ -22,7 +23,8 @@ class BonelessLED(Elaboratable):
 
         self.cpu_rom = Memory(width=16, depth=512,
             init=Instr.assemble(firmware(self.gp.bpp)))
-        self.cpu_core = CoreFSM(alsru_cls=ALSRU_4LUT, memory=self.cpu_rom)
+        self.cpu_ram = SPRAM()
+        self.cpu_core = CoreFSM(alsru_cls=ALSRU_4LUT)
 
         self.uart = uart.SimpleUART(
             default_divisor=uart.calculate_divisor(12e6, 115200))
@@ -35,7 +37,47 @@ class BonelessLED(Elaboratable):
         m = Module()
         m.submodules.panel = panel = self.panel
         m.submodules.cpu_core = cpu_core = self.cpu_core
+        m.submodules.cpu_rom_r = cpu_rom_r = self.cpu_rom.read_port(
+            transparent=False)
+        m.submodules.cpu_rom_w = cpu_rom_w = self.cpu_rom.write_port()
+        m.submodules.cpu_ram = cpu_ram = self.cpu_ram
         m.submodules.uart = uart = self.uart
+
+        # split up main bus
+        rom_en = Signal()
+        ram_en = Signal()
+        m.d.comb += [
+            rom_en.eq(cpu_core.o_bus_addr[-1] == 0),
+            ram_en.eq(cpu_core.o_bus_addr[-1] == 1),
+        ]
+        # we need to know who was enabled one cycle later so we can route the
+        # read result back correctly.
+        rom_was_en = Signal()
+        ram_was_en = Signal()
+        m.d.sync += [
+            rom_was_en.eq(rom_en),
+            ram_was_en.eq(ram_en),
+        ]
+        m.d.comb += [
+            # address bus to the memories
+            cpu_rom_r.addr.eq(cpu_core.o_bus_addr),
+            cpu_rom_w.addr.eq(cpu_core.o_bus_addr),
+            cpu_ram.i_addr.eq(cpu_core.o_bus_addr),
+            # write data to memories
+            cpu_rom_w.data.eq(cpu_core.o_mem_data),
+            cpu_ram.i_data.eq(cpu_core.o_mem_data),
+            # selects to memories
+            cpu_rom_r.en.eq(rom_en & cpu_core.o_mem_re),
+            cpu_rom_w.en.eq(rom_en & cpu_core.o_mem_we),
+            cpu_ram.i_re.eq(ram_en & cpu_core.o_mem_re),
+            cpu_ram.i_we.eq(ram_en & cpu_core.o_mem_we),
+        ]
+        # read results back to cpu
+        with m.If(rom_was_en):
+            m.d.comb += cpu_core.i_mem_data.eq(cpu_rom_r.data)
+        with m.Elif(ram_was_en):
+            m.d.comb += cpu_core.i_mem_data.eq(cpu_ram.o_data)
+
 
         # split up the external bus
         uart_en = Signal()
