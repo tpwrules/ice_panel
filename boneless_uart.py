@@ -137,7 +137,7 @@ def firmware(bpp):
             LDR(curr_char, curr_msg_ptr, "message"),
         L("busy"), # loop while the UART doesn't have space for another char
             LDXA(temp1, 2),
-            ANDI(temp1, temp1, 0x8000),
+            ANDI(temp1, temp1, 1),
             BNZ("busy"),
             ADDI(curr_char, curr_char, ord('a')),
             STXA(curr_char, 2),
@@ -175,8 +175,8 @@ def firmware(bpp):
 
         # let the user type their own characters!
         LDXA(curr_font_data, 3),
-        ANDI(temp1, curr_font_data, 0x8000), # is there one available?
-        BNZ("e_done"), # nope, sorry
+        ROLI(curr_font_data, curr_font_data, 1), # is there one available?
+        BS1("e_done"), # nope, sorry
 
         # there is. shuffle the message characters back to make room for it
         MOVI(curr_msg_ptr, 0),
@@ -194,7 +194,7 @@ def firmware(bpp):
         # be sure to echo the character
     L("e_tx_busy"), # loop while the UART doesn't have space for another char
         LDXA(temp1, 2),
-        ANDI(temp1, temp1, 0x8000),
+        ANDI(temp1, temp1, 1),
         BNZ("e_tx_busy"),
         STXA(curr_font_data, 2),
 

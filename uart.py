@@ -17,12 +17,16 @@ from boneless.arch.opcode import *
 #          bit  0: 1 if receive FIFO overflowed. write 1 to reset.
 
 # 0x2: (R/W) Transmit Data / TX FIFO Status
-#    Read: bit 15: 1 if the TX FIFO is full, 0 otherwise.
+#    Read:  bit 0: 1 if the TX FIFO is full, 0 otherwise.
 #   Write:    n-0: queue written character for transmission.
 
 # 0x3: (R) RX FIFO Status and Receive Data
-#    Read: bit 15: 1 if the RX FIFO is empty, 0 otherwise
-#             n-0: read character, if the RX FIFO is not empty
+#    Read: bit 15: bit 0 of read character, if the RX FIFO is not empty
+#          bit 14: 1 if the RX FIFO is empty, 0 otherwise
+#         (n-1)-0: remaining n-1 bits of read character, if RX fifo is not empty
+#    this bizarre arrangement is so that ROLI(v, v, 1) sets S to 1 if
+#    the character is invalid. otherwise, S is 0 and v is the correctly aligned
+#    character.
 
 class SetReset(Elaboratable):
     def __init__(self, parent, *, priority, initial=False):
@@ -114,14 +118,15 @@ class SimpleUART(Elaboratable):
                         read_data[0].eq(r1_rx_overflow.value),
                     ]
                 with m.Case(2): # tx fifo status register
-                    m.d.comb += read_data[15].eq(r2_tx_full.value)
+                    m.d.comb += read_data[0].eq(r2_tx_full.value)
                 with m.Case(3): # rx fifo status + read data register
                     # we don't really have a FIFO, just a buffer register and an
                     # input shift register. so do FIFO-type logic here.
-                    m.d.comb += read_data[15].eq(r3_rx_empty.value)
+                    m.d.comb += read_data[14].eq(r3_rx_empty.value)
                     # even if the buffer is "empty", the contents are still
                     # defined. read them out so we don't have to have a mux.
-                    m.d.comb += read_data[:self.char_bits].eq(r3_rx_data)
+                    m.d.comb += read_data[15].eq(r3_rx_data[0])
+                    m.d.comb += read_data[:self.char_bits-1].eq(r3_rx_data[1:])
                     # and since we have read the only thing out of the buffer,
                     # it's now empty
                     m.d.comb += r3_rx_empty.set.eq(1)
