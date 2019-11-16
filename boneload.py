@@ -95,6 +95,7 @@
 from boneless.gateware import ALSRU_4LUT, CoreFSM
 from boneless.arch.opcode import Instr
 from boneless.arch.opcode import *
+from bonetools import *
 import serial
 import random
 
@@ -108,33 +109,29 @@ import random
 def _bfw_calc_crc():
     # generate random prefix so that we effectively can make local labels
     lp = "_{}_".format(random.randrange(2**32))
-    frame_ptr = R6
-    curr_addr = R5
-    end_addr = R4
-    bit_ctr = R3
-    old_crc = R1
-    crc = R0
+    r = RegisterManager("R6:frame_ptr R5:curr_addr R4:end_addr R3:bit_ctr "
+        "R2:new_word R1:old_crc R0:crc")
     return [
         # set up register frame and load parameters
-        LDW(frame_ptr, -8),
-        LD(curr_addr, frame_ptr, 5),
-        LD(end_addr, frame_ptr, 4),
-        MOVI(crc, 0),
+        LDW(r.frame_ptr, -8),
+        LD(r.curr_addr, r.frame_ptr, 5),
+        LD(r.end_addr, r.frame_ptr, 4),
+        MOVI(r.crc, 0),
     L(lp+"words"),
-        LD(bit_ctr, curr_addr, 0), # (reuse bit_ctr to hold the new word)
-        XOR(crc, crc, bit_ctr), # mix new bits into CRC
-        MOVI(bit_ctr, 16),
+        LD(r.new_word, r.curr_addr, 0),
+        XOR(r.crc, r.crc, r.new_word), # mix new bits into CRC
+        MOVI(r.bit_ctr, 16),
     L(lp+"bits"), # update CRC for every bit in the word
-        MOV(old_crc, crc), # copy so we can query lowest bit
-        SRLI(crc, crc, 1),
-        ANDI(old_crc, old_crc, 1), # was lowest bit set?
+        MOV(r.old_crc, r.crc), # copy so we can query lowest bit
+        SRLI(r.crc, r.crc, 1),
+        ANDI(r.old_crc, r.old_crc, 1), # was lowest bit set?
         BZ1(lp+"nope"),
-        XORI(crc, crc, 0x8408), # yes, XOR in polynomial
+        XORI(r.crc, r.crc, 0x8408), # yes, XOR in polynomial
     L(lp+"nope"),
-        SUBI(bit_ctr, bit_ctr, 1),
+        SUBI(r.bit_ctr, r.bit_ctr, 1),
         BNZ(lp+"bits"), # loop through the remaining bits in this word
-        ADDI(curr_addr, curr_addr, 1),
-        CMP(curr_addr, end_addr),
+        ADDI(r.curr_addr, r.curr_addr, 1),
+        CMP(r.curr_addr, r.end_addr),
         BNE(lp+"words"), # loop through the words we were asked to calculate
 
         # take down register frame and return
