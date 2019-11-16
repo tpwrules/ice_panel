@@ -423,6 +423,11 @@ def _bfw_main(uart_addr):
         MOVR(temp1, "pb_data"),
         LD(R0, temp1, 0), # dest addr
         LD(R1, temp1, 1), # dest W
+        # tell the host that we successfully got everything before we jump into
+        # the app code
+        MOVI(R4, 1),
+        MOVI(R5, 0),
+        JAL(return_addr, "tx_packet"),
         XCHW(R7, R1), # set new W and store current one
         LD(R7, R7, 0), # get jump destination
         JR(R7, 0), # and jump to it
