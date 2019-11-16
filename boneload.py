@@ -32,26 +32,26 @@
 # selected and used.
 
 # commands
-# command 0: identify
+# command 1: identify
 #   length: 0
 #   parameter words: none
 #   result codes: identify, invalid length
 #   purpose: sends information about the system boneload is running on
 
-# command 1: write data
+# command 2: write data
 #   length: 1-max length
 #   parameter words: destination address, data to write*length-1
 #   result codes: success, invalid length
 #   purpose: writes words to arbitrary memory address. note that boneload lives
 #   from $FF00 to $FFFF, and overwriting it would be bad.
 
-# command 2: read data
+# command 3: read data
 #   length: 2
 #   parameter words: source address, source length (up to max length)
 #   result codes: read result, invalid length
 #   purpose: reads words from arbitrary memory address.
 
-# command 3: jump to code
+# command 4: jump to code
 #   length: 2
 #   parameter words: destination address, new W address
 #   result codes: success, execution complete, invalid length
@@ -59,35 +59,35 @@
 #       the code, R7 will have return address and R6 will have previous W.
 #       succese is before jump, execution complete is sent if jump returns.
 
-# command 4: calculate CRC
+# command 5: calculate CRC
 #   length 2:
 #   parameter words: start address, end address (exclusive)
 #   result codes: CRC result, invalid length
 #   purpose: calculate CRC-16/KERMIT of arbitrary memory region
 
 # results
-# result 0: success
+# result 1: success
 #   length: 0
 #   parameter words: none
 #   purpose: say that everything went great
 
-# result 1: invalid command
+# result 2: invalid command
 #   length: 1
 #   parameter words: reason: 0=unknown cmd, 1=invalid length, 2=bad CRC,
 #                            3=timeout
 #   purpose: say that the command couldn't be processed for whatever reason.
 
-# result 2: CRC result
+# result 3: CRC result
 #   length: 2
 #   parameter words: CRC of desired region
 #   purpose: give back the CRC
 
-# result 3: read result
+# result 4: read result
 #   length: 0-max length
 #   parameter words: the words
 #   purpose: give back the read words
 
-# result 4: identify
+# result 5: identify
 #   length: 3
 #   parameter words: boot version (currently 1), board id, max length
 #   purpose: say stuff about ourselves
@@ -358,7 +358,8 @@ def _bfw_main(uart_addr):
         # otherwise, dispatch the command
         # a switch table would be nice, but we can't actually declare one yet
         LDR(command, result, "pb_cmdresp"), # (we know result = 0)
-        CMPI(command, 0),
+        SRLI(command, command, 8),
+        CMPI(command, 1),
         BEQ("sys_cmd_identify"),
         # oh no, we don't know what the command is
         # fortunately, a result of 0 also = bad command
@@ -367,14 +368,14 @@ def _bfw_main(uart_addr):
         # store the problem in the packet
         MOVI(temp1, 0),
         STR(result, temp1, "pb_data"),
-        # result code 1 with length 1
-        MOVI(R4, 1),
+        # result code 2 with length 1
+        MOVI(R4, 2),
         MOVI(R5, 1),
         JAL(return_addr, "tx_packet"),
         J("sys_packet_rx"), # do it all again
     L("sys_packet_tx_success"), # say everything went great
-        # result code 0 with length 0
-        MOVI(R4, 0),
+        # result code 1 with length 0
+        MOVI(R4, 1),
         MOVI(R5, 0),
         JAL(return_addr, "tx_packet"),
         J("sys_packet_rx"), # do it all again
@@ -387,9 +388,9 @@ def _bfw_main(uart_addr):
         MOVI(temp2, 0x69), # board id
         ST(temp2, temp1, 1),
         MOVI(temp2, max_length), # max packet len
-        ST(temp2, temp1, 1),
-        # result code 4 with length 3
-        MOVI(R4, 4),
+        ST(temp2, temp1, 2),
+        # result code 5 with length 3
+        MOVI(R4, 5),
         MOVI(R5, 3),
         JAL(return_addr, "tx_packet"),
         J("sys_packet_rx"),
@@ -491,7 +492,7 @@ def _bl_command(ser, command, params):
     if response_len != len(words)-1:
         raise BLError("was told to expect {} words but got {} words".format(
             response_len, len(words)-1))
-    if response == 1:
+    if response == 2:
         problems = {0: "unknown command", 1: "invalid length",
             2: "bad CRC", 3: "timeout"}
         raise BLError("was told: '{}'".format(
@@ -499,7 +500,7 @@ def _bl_command(ser, command, params):
     return response, words[1:]
 
 def _bl_identify(ser):
-    return _bl_command(ser, 0, [])[1]
+    return _bl_command(ser, 1, [])[1]
 
 
 # boneload the given firmware to the given port. firmware should be a list of
