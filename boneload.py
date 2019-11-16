@@ -347,6 +347,7 @@ def _bfw_main(uart_addr):
     temp1 = R4
     temp2 = R3
     temp3 = R2
+    temp4 = R1
     fw.append([
     L("sys_packet_rx"),
         # get a new packet from whatever's bootloading us
@@ -361,6 +362,10 @@ def _bfw_main(uart_addr):
         SRLI(command, command, 8),
         CMPI(command, 1),
         BEQ("sys_cmd_identify"),
+        CMPI(command, 2),
+        BEQ("sys_cmd_write_data"),
+        CMPI(command, 4),
+        BEQ("sys_cmd_jump_to_code"),
         # oh no, we don't know what the command is
         # fortunately, a result of 0 also = bad command
         # so just fall through to sending a problem packet
@@ -394,6 +399,33 @@ def _bfw_main(uart_addr):
         MOVI(R5, 3),
         JAL(return_addr, "tx_packet"),
         J("sys_packet_rx"),
+
+    L("sys_cmd_write_data"),
+        # write some data to some address
+        # TODO validate length
+        MOVR(temp1, "pb_data"),
+        LD(temp2, temp1, 0), # dest addr
+        LD(temp3, temp1, -1), # command/length
+        ANDI(temp3, temp3, 0xFF),
+        MOVI(temp1, 1), # current pos
+    L("_scwd_copy"),
+        LDR(temp4, temp1, "pb_data"),
+        ST(temp4, temp2, 0),
+        ADDI(temp2, temp2, 1),
+        ADDI(temp1, temp1, 1),
+        CMP(temp1, temp3),
+        BNE("_scwd_copy"),
+        J("sys_packet_tx_success"),
+
+    L("sys_cmd_jump_to_code"),
+        # jump to some downloaded code
+        # TODO validate length
+        MOVR(temp1, "pb_data"),
+        LD(R0, temp1, 0), # dest addr
+        LD(R1, temp1, 1), # dest W
+        XCHW(R7, R1), # set new W and store current one
+        LD(R7, R7, 0), # get jump destination
+        JR(R7, 0), # and jump to it
     ])
 
     fw.append([ # declare subroutines
@@ -456,7 +488,7 @@ def ser_read(ser, length):
     read = b""
     while length > 0:
         new = ser.read(length)
-        if new == 0:
+        if len(new) == 0:
             raise Timeout("read timeout")
         read += new
         length -= len(new)
@@ -483,7 +515,7 @@ def _bl_transact(ser, command):
 # send a given command with its parameters, then check for common results
 def _bl_command(ser, command, params):
     words = []
-    words.append(command<<8 + len(params))
+    words.append((command<<8) + len(params))
     words.extend(params)
     words.append(_crc(words))
     words = _bl_transact(ser, words)
@@ -502,6 +534,20 @@ def _bl_command(ser, command, params):
 def _bl_identify(ser):
     return _bl_command(ser, 1, [])[1]
 
+def _bl_write_data(ser, addr, data, max_len):
+    written = 0
+    while written < len(data):
+        to_write = max_len-1 # save room for address
+        r, p = _bl_command(ser, 2, (addr+written,
+            *data[written:written+to_write]))
+        if r != 1:
+            raise Exception("huh? {} {}".format(r, p))
+        written += to_write
+
+def _bl_jump_to_code(ser, addr, w):
+    r, p = _bl_command(ser, 4, [addr, w])
+    if r != 1:
+        raise Exception("huh? {} {}".format(r, p))
 
 # boneload the given firmware to the given port. firmware should be a list of
 # integers (each one is one word) and the port should be a string that can be
@@ -513,10 +559,20 @@ def boneload(firmware, port):
     print("Identifying (reset board please)...")
     while True:
         try:
-            print(_bl_identify(ser))
+            ident = _bl_identify(ser)
             break
         except Timeout:
             pass
+
+    if ident[0] != 1:
+        raise Exception("incompatible version {}".format(ident[0]))
+
+    print("Identified! Board ID=0x{:02X}, max length={}".format(*ident[1:]))
+    print("Downloading program...")
+    _bl_write_data(ser, 0, Instr.assemble(firmware), ident[2])
+    print("Beginning execution...")
+    _bl_jump_to_code(ser, 0, 0xFFF)
+    print("Complete!")
 
 if __name__ == "__main__":
     print(len(boneload_fw()))
