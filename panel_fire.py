@@ -128,7 +128,7 @@ def firmware(bpp,
     r -= "!"
     r += "R7:delay_ctr"
     fw.append([
-        MOVI(r.delay_ctr, 12000),
+        MOVI(r.delay_ctr, delay_time),
     L("delay_loop"),
         SUBI(r.delay_ctr, r.delay_ctr, 1),
         BNE("delay_loop"),
