@@ -245,63 +245,60 @@ def _bfw_rx_packet(uart_addr, max_length, timeout_ms=500):
 # transmit a packet
 # on entry (in caller window):
 # R7: return address
-# R5: packet length (excluding CRC and result word)
-# R4: result code
+# R5: result word
 # on exit (in our window):
 # nothing of significance
 def _bfw_tx_packet(uart_addr):
     # generate random prefix so that we effectively can make local labels
     lp = "_{}_".format(random.randrange(2**32))
     r = RegisterManager("R7:lr R6:fp "
-        "R4:result R3:length R2:crc R1:temp1 R0:buf_ptr")
-    return [
-        # create register frame and load parameters
+        "R5:crc_start R4:crc_end R3:buf_ptr R2:result_word R1:crc R0:length")
+    fw = [
+        # get the passed in result word
         LDW(r.fp, -8),
-        LD(r.length, r.fp, 5),
-        LD(r.result, r.fp, 4),
-
-        # pack up the result word
-        SLLI(r.temp1, r.result, 8),
-        OR(r.temp1, r.temp1, r.length),
-        MOVI(r.crc, 0),
+        LD(r.result_word, r.fp, 5),
         # and store it to the buffer
-        STR(r.temp1, r.crc, "pb_cmdresp"),
+        MOVI(r.buf_ptr, 0),
+        STR(r.result_word, r.buf_ptr, "pb_cmdresp"),
 
+        ANDI(r.length, r.result_word, 0xFF), # get length from result
         ADDI(r.length, r.length, 1), # bump length to include response word
         # calculate CRC of the packet
-        MOVR(R5, "pb_cmdresp"),
-        ADD(R4, R5, r.length),
-        JAL(R7, "calc_crc"),
+        MOVR(r.crc_start, "pb_cmdresp"),
+        ADD(r.crc_end, r.crc_start, r.length),
+        JAL(r.lr, "calc_crc"),
         LD(r.crc, r.fp, -16+0),
         # and store it at the end of the buffer
         STR(r.crc, r.length, "pb_cmdresp"),
-
+    ]
+    r -= "crc_start crc_end result_word crc"
+    r += "R2:tx_space R1:tx_word"
+    fw.append([
         # actually transmit the packet
-        MOVR(r.buf_ptr, "pb_cmdresp"),
-        ADDI(r.length, r.length, 1), # bump length to include CRC
-        ADD(r.length, r.length, r.buf_ptr),
-        # use 'crc' as temp variable for what to send
     L(lp+"tx"),
-        LD(r.crc, r.buf_ptr, 0), # get this word from the buffer
-        JAL(R7, lp+"tx_byte"), # transmit the low byte
-        SRLI(r.crc, r.crc, 8), # get high byte of word
-        JAL(R7, lp+"tx_byte"), # and send it
+        LDR(r.tx_word, r.buf_ptr, "pb_cmdresp"), # get this word from the buffer
+        JAL(r.lr, lp+"tx_byte"), # transmit the low byte
+        SRLI(r.tx_word, r.tx_word, 8), # get high byte of word
+        JAL(r.lr, lp+"tx_byte"), # then send it
         ADDI(r.buf_ptr, r.buf_ptr, 1),
         CMP(r.buf_ptr, r.length), # done with the buffer?
-        BNE(lp+"tx"),
+        BLEU(lp+"tx"), # include case when length = buffer to tx CRC too
+
         ADJW(8),
         JR(R7, 0), # R7 in caller's window
 
     L(lp+"tx_byte"),
         # wait until the transmit fifo has space
-        LDXA(r.temp1, uart_addr+2),
-        ANDI(r.temp1, r.temp1, 1),
+        LDXA(r.tx_space, uart_addr+2),
+        ANDI(r.tx_space, r.tx_space, 1),
         BZ0(lp+"tx_byte"),
         # then send the byte
-        ANDI(r.temp1, r.crc, 0xFF),
-        STXA(r.temp1, uart_addr+2),
+        ANDI(r.tx_space, r.tx_word, 0xFF),
+        STXA(r.tx_space, uart_addr+2),
         JR(R7, 0),
-    ]
+    ])
+
+    return fw
 
 def _bfw_main(uart_addr):
     max_length = 16 # adjust to fill memory
@@ -338,14 +335,12 @@ def _bfw_main(uart_addr):
         MOVI(r.temp1, 0),
         STR(r.result, r.temp1, "pb_data"),
         # result code 2 with length 1
-        MOVI(R4, 2),
-        MOVI(R5, 1),
+        MOVI(R5, 0x0201),
         JAL(r.lr, "tx_packet"),
         J("sys_packet_rx"), # do it all again
     L("sys_packet_tx_success"), # say everything went great
         # result code 1 with length 0
-        MOVI(R4, 1),
-        MOVI(R5, 0),
+        MOVI(R5, 0x0100),
         JAL(r.lr, "tx_packet"),
         J("sys_packet_rx"), # do it all again
 
@@ -359,8 +354,7 @@ def _bfw_main(uart_addr):
         MOVI(r.temp2, max_length), # max packet len
         ST(r.temp2, r.temp1, 2),
         # result code 5 with length 3
-        MOVI(R4, 5),
-        MOVI(R5, 3),
+        MOVI(R5, 0x0503),
         JAL(r.lr, "tx_packet"),
         J("sys_packet_rx"),
 
@@ -389,8 +383,7 @@ def _bfw_main(uart_addr):
         LD(R1, r.temp1, 1), # dest W
         # tell the host that we successfully got everything before we jump into
         # the app code
-        MOVI(R4, 1),
-        MOVI(R5, 0),
+        MOVI(R5, 0x0100),
         JAL(r.lr, "tx_packet"),
         XCHW(R7, R1), # set new W and store current one
         LD(R7, R7, 0), # get jump destination
