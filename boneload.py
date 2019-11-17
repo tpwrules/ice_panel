@@ -139,123 +139,108 @@ def _bfw_calc_crc():
         JR(R7, 0), # R7 in caller's window
     ]
 
-# receive one byte from the UART with constant timeout (in ms, approx)
-# on entry (in caller window):
-# R7: return address
-# on exit (in our window):
-# R0: gotten byte ROR 1 (or 14th bit set + junk if timeout)
-def _bfw_rx_byte(uart_addr, timeout=500):
-    timeout = int((12e6*(500/1e3))//(4*6)) # 6 insns at ~4 cycles per insn
-    # generate random prefix so that we effectively can make local labels
-    lp = "_{}_".format(random.randrange(2**32))
-    r = RegisterManager("R5:timeout_ctr_hi R4:timeout_ctr_lo "
-        "R3:junk R0:got_byte")
-    return [
-        # create register frame. we don't need a frame pointer since we don't
-        # have any parameters.
-        ADJW(-8),
-
-        # set up time counters with precalculated duration
-        MOVI(r.timeout_ctr_hi, (timeout>>16)+1),
-        MOVI(r.timeout_ctr_lo, timeout&0xFFFF),
-    L(lp+"rx"),
-        # get potential byte from the peripheral
-        LDXA(r.got_byte, uart_addr+3),
-        # make sure we've got a real byte
-        # (but don't return the rotated version; we want our caller to be able
-        # to check the same way!)
-        ROLI(r.junk, r.got_byte, 1),
-        BS0(lp+"done"), # and we can return with it
-        # otherwise, count down the timeout
-        SUBI(r.timeout_ctr_lo, r.timeout_ctr_lo, 1),
-        SBCI(r.timeout_ctr_hi, r.timeout_ctr_hi, 0),
-        # if the high half reached zero, the timeout is over. but the got byte
-        # already has the appropriate bit set since we just read the peripheral.
-        # so we can just fall through and return.
-        BNZ(lp+"rx"),
-    L(lp+"done"),
-        # byte is already where it needs to be, so take down register frame and
-        # return
-        ADJW(8),
-        JR(R7, 0), # R7 in caller's window
-    ]
-
 # receive a packet
 # on entry (in caller window):
 # R7: return address
 # on exit (in our window):
 # R0: issues: 0 = ok, 1 = bad length, 2 = bad CRC, 3 = timeout
-def _bfw_rx_packet(max_length):
+def _bfw_rx_packet(uart_addr, max_length, timeout_ms=500):
     # generate random prefix so that we effectively can make local labels
     lp = "_{}_".format(random.randrange(2**32))
-    r = RegisterManager("R7:lr R6:fp "
-        "R5:buf_pos R4:got_word R3:temp1 R2:temp2 R1:length R0:issues")
-    return [
-        # create register frame (we need the pointer to access return values)
-        LDW(r.fp, -8),
-
-        MOVI(r.issues, 0),
+    r = RegisterManager(
+        "R7:lr R6:command R2:got_byte R1:length R0:issues")
+    fw = [
+        # create register frame
+        ADJW(-8),
         # secretly the command word is two bytes!
         # receive the length byte first
-        JAL(r.temp1, lp+"rx_or_timeout"),
-        MOV(r.length, r.temp2),
+        JAL(r.lr, lp+"rx_or_timeout"),
+        MOV(r.length, r.got_byte),
         # then get the command byte
-        JAL(r.temp1, lp+"rx_or_timeout"),
+        JAL(r.lr, lp+"rx_or_timeout"),
         # and reform the command word
-        SLLI(r.temp2, r.temp2, 8),
-        OR(r.length, r.length, r.temp2),
-        STR(r.length, r.issues, "pb_cmdresp"), # issues = 0
-        # now get the actual length back
-        ANDI(r.length, r.length, 0xFF),
-        ADDI(r.length, r.length, 1), # add 1 to account for CRC word
-        # make sure we can actually fit the length
+        SLLI(r.command, r.got_byte, 8),
+        OR(r.command, r.command, r.length),
+        MOVI(r.issues, 0), # by default there is no issue
+        STR(r.command, r.issues, "pb_cmdresp"), # issues = 0
+        ADDI(r.length, r.length, 1), # add 1 to length to account for CRC word
+        # make sure we can actually fit that many words
         CMPI(r.length, max_length+1),
         BLEU(lp+"goodlength"),
         # it's too long! we would overflow something.
         MOVI(r.issues, 1),
         J(lp+"ret"),
+    ]
+    r -= "command"
+    r += "R4:got_word R3:buf_pos"
+    fw.append([
     L(lp+"goodlength"),
         # now we can start receiving the words
         MOVI(r.buf_pos, 0),
     L(lp+"rx_words"),
         # get low half
-        JAL(r.temp1, lp+"rx_or_timeout"),
-        MOV(r.got_word, r.temp2),
+        JAL(r.lr, lp+"rx_or_timeout"),
+        MOV(r.got_word, r.got_byte),
         # then high half
-        JAL(r.temp1, lp+"rx_or_timeout"),
-        SLLI(r.temp2, r.temp2, 8),
-        OR(r.got_word, r.got_word, r.temp2),
+        JAL(r.lr, lp+"rx_or_timeout"),
+        SLLI(r.got_byte, r.got_byte, 8),
+        OR(r.got_word, r.got_word, r.got_byte),
         # and store to the buffer
         STR(r.got_word, r.buf_pos, "pb_data"),
         ADDI(r.buf_pos, r.buf_pos, 1),
         CMP(r.buf_pos, r.length),
         BNE(lp+"rx_words"),
-
-        # get CRC out of buffer
-        LDR(r.temp1, r.length, "pb_cmdresp"),
-        # then calculate what the buffer's CRC actually is
-        MOVR(R5, "pb_cmdresp"),
-        ADD(R4, R5, r.length),
+    ])
+    r -= "buf_pos got_word"
+    r += "R3:calc_crc R5:crc_start R4:crc_end"
+    fw.append([
+        # calculate what the buffer's CRC actually is
+        MOVR(r.crc_start, "pb_cmdresp"),
+        ADD(r.crc_end, r.crc_start, r.length),
         JAL(r.lr, "calc_crc"),
+        LDW(r.calc_crc, 0),
+        LD(r.calc_crc, r.calc_crc, -8+0)
+    ])
+    r -= "crc_start crc_end"
+    r += "R4:got_crc"
+    fw.append([
         # and compare it with what it should be
-        LD(r.temp2, r.fp, -16+0),
-        CMP(r.temp1, r.temp2),
+        LDR(r.got_crc, r.length, "pb_cmdresp"),
+        CMP(r.calc_crc, r.got_crc),
         BEQ(lp+"ret"),
         # if they don't match, signal CRC error
         MOVI(r.issues, 2),
     L(lp+"ret"),
         ADJW(8),
         JR(R7, 0), # R7 in caller's window
+    ])
+    r -= "calc_crc got_crc"
+    r += "R5:timeout_ctr_hi R6:timeout_ctr_lo"
+    # 6 insns at ~4 cycles per insn
+    timeout = int((12e6*(timeout_ms/1e3))//(4*6))
+    fw.append([
     L(lp+"rx_or_timeout"),
-        JAL(r.lr, "rx_byte"),
-        LD(r.temp2, r.fp, -16+0),
-        ROLI(r.temp2, r.temp2, 1),
-        BS1(lp+"timedout"),
-        JR(r.temp1, 0),
-    L(lp+"timedout"),
+        # set up time counters with precalculated duration
+        MOVI(r.timeout_ctr_hi, (timeout>>16)+1),
+        MOVI(r.timeout_ctr_lo, timeout&0xFFFF),
+    L(lp+"byte_rx"),
+        # get potential byte from the peripheral
+        LDXA(r.got_byte, uart_addr+3),
+        # make sure we've got a real byte
+        ROLI(r.got_byte, r.got_byte, 1),
+        BS0(lp+"byte_done"), # and we can return with it
+        # otherwise, count down the timeout
+        SUBI(r.timeout_ctr_lo, r.timeout_ctr_lo, 1),
+        SBCI(r.timeout_ctr_hi, r.timeout_ctr_hi, 0),
+        BNZ(lp+"byte_rx"),
+        # if the high half reached zero, the timeout is over.
         MOVI(r.issues, 3),
         J(lp+"ret"),
-    ]
+    L(lp+"byte_done"),
+        JR(r.lr, 0),
+    ])
+
+    return fw
 
 # transmit a packet
 # on entry (in caller window):
@@ -415,10 +400,8 @@ def _bfw_main(uart_addr):
     fw.append([ # declare subroutines
     L("calc_crc"),
         _bfw_calc_crc(),
-    L("rx_byte"),
-        _bfw_rx_byte(uart_addr),
     L("rx_packet"),
-        _bfw_rx_packet(max_length),
+        _bfw_rx_packet(uart_addr, max_length),
     L("tx_packet"),
         _bfw_tx_packet(uart_addr),
     ])
