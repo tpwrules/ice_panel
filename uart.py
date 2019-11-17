@@ -8,7 +8,8 @@ from boneless.arch.opcode import *
 
 # 0x0: (W) Baud Rate / (R) Status
 #   Write:   15-0: Baud Rate divisor. rate = (input freq/divisor)-1
-#    Read: bit 15: 1 if transmission in progress, 0 otherwise
+#    Read: bit 15: 1 if transmission in progress, 0 otherwise. the transmit
+#                  FIFO is empty and the bus is idle iff this bit is 0.
 #          bit  0: 1 if reception in progress, 0 otherwise
 
 # 0x1: (R/W) Error
@@ -187,7 +188,10 @@ class SimpleUART(Elaboratable):
                     m.d.sync += baud_ctr.eq(baud_ctr-1)
                     with m.If(baud_ctr == 0):
                         with m.If(bit_ctr == 0): # we just sent the stop bit?
-                            m.d.sync += r0_tx_active.eq(0) # yes, we are done!
+                            with m.If(~r2_tx_full.value):
+                                # we are done! (iff the FIFO is empty)
+                                m.d.sync += r0_tx_active.eq(0)
+                                # otherwise, we will restart immediately
                             # the stop bit leaves the bus idle
                             m.next = "IDLE"
                         with m.Else():
