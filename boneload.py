@@ -304,22 +304,27 @@ def _bfw_main(uart_addr):
     max_length = 16 # adjust to fill memory
     fw = []
 
-    our_window = 0xFFF8 # W when chip is reset
-
-    # PACKET RECEIVE SECTION
     r = RegisterManager("R7:lr R6:fp "
-        "R5:command R4:temp1 R3:temp2 R2:temp3 R1:temp4 R0:result")
+        "R5:result_code R4:command R1:buf_ptr R0:length")
     fw.append([
     L("sys_packet_rx"),
-        MOVI(r.fp, our_window),
-        # get a new packet from whatever's bootloading us
+        LDW(r.fp, 0), # fetch window so we can get return values
+        # receive a new packet from whatever's bootloading us
         JAL(r.lr, "rx_packet"),
-        LD(r.result, r.fp, -8+0),
-        AND(r.result, r.result, r.result), # if nonzero, there was an issue
+        LD(r.result_code, r.fp, -8+0),
+        # load LR with the top of the rx loop so that subfunctions can just jump
+        # to the tx packet routine and have it return correctly.
+        MOVR(r.lr, "sys_packet_rx"),
+        # and load the pointer to the buffer so the subfunctions can easily
+        # access it.
+        MOVR(r.buf_ptr, "pb_data"),
+        # if the result was nonzero, there was some issue
+        AND(r.result_code, r.result_code, r.result_code),
         BNZ("sys_packet_tx_issue"),
         # otherwise, dispatch the command
         # a switch table would be nice, but we can't actually declare one yet
-        LDR(r.command, r.result, "pb_cmdresp"), # (we know result = 0)
+        LDR(r.command, r.result_code, "pb_cmdresp"), # (we know result_code = 0)
+        ANDI(r.length, r.command, 0xFF),
         SRLI(r.command, r.command, 8),
         CMPI(r.command, 1),
         BEQ("sys_cmd_identify"),
@@ -329,64 +334,78 @@ def _bfw_main(uart_addr):
         BEQ("sys_cmd_jump_to_code"),
         # oh no, we don't know what the command is
         # fortunately, a result of 0 also = bad command
-        # so just fall through to sending a problem packet
-    L("sys_packet_tx_issue"), # send error packet with problem in result
-        # store the problem in the packet
-        MOVI(r.temp1, 0),
-        STR(r.result, r.temp1, "pb_data"),
+        J("sys_packet_tx_issue"),
+    L("sys_packet_tx_invalid_length"),
+        MOVI(r.result_code, 1),
+        # fall through to tx issue packet
+    ])
+    r -= "fp command"
+    r += "R6:zero"
+    fw.append([
+    L("sys_packet_tx_issue"), # send error packet with problem in result_code
+        # store the problem into the packet
+        MOVI(r.zero, 0),
+        STR(r.result_code, r.zero, "pb_data"),
         # result code 2 with length 1
-        MOVI(R5, 0x0201),
-        JAL(r.lr, "tx_packet"),
-        J("sys_packet_rx"), # do it all again
+        MOVI(r.result_code, 0x0201),
+        J("tx_packet"), # LR is set to return to sys_packet_rx
     L("sys_packet_tx_success"), # say everything went great
         # result code 1 with length 0
-        MOVI(R5, 0x0100),
-        JAL(r.lr, "tx_packet"),
-        J("sys_packet_rx"), # do it all again
-
+        MOVI(r.result_code, 0x0100),
+        J("tx_packet"), # LR is set to return to sys_packet_rx
+    ])
+    r -= "zero"
+    r += "R6:ident_info"
+    fw.append([
     L("sys_cmd_identify"),
+        # we don't expect any additional information
+        CMPI(r.length, 0),
+        BNE("sys_packet_tx_invalid_length"),
         # write identification data to buffer
-        MOVR(r.temp1, "pb_data"),
-        MOVI(r.temp2, 1), # boot version
-        ST(r.temp2, r.temp1, 0),
-        MOVI(r.temp2, 0x69), # board id
-        ST(r.temp2, r.temp1, 1),
-        MOVI(r.temp2, max_length), # max packet len
-        ST(r.temp2, r.temp1, 2),
+        MOVR(r.buf_ptr, "pb_data"),
+        MOVI(r.ident_info, 1), # boot version
+        ST(r.ident_info, r.buf_ptr, 0),
+        MOVI(r.ident_info, 0x69), # board id
+        ST(r.ident_info, r.buf_ptr, 1),
+        MOVI(r.ident_info, max_length), # max packet len
+        ST(r.ident_info, r.buf_ptr, 2),
         # result code 5 with length 3
-        MOVI(R5, 0x0503),
-        JAL(r.lr, "tx_packet"),
-        J("sys_packet_rx"),
-
+        MOVI(r.result_code, 0x0503),
+        J("tx_packet"), # LR is set to return to sys_packet_rx
+    ])
+    r -= "ident_info"
+    r += "R6:dest_addr R3:copy_tmp"
+    fw.append([
     L("sys_cmd_write_data"),
         # write some data to some address
-        # TODO validate length
-        MOVR(r.temp1, "pb_data"),
-        LD(r.temp2, r.temp1, 0), # dest addr
-        LD(r.temp3, r.temp1, -1), # command/length
-        ANDI(r.temp3, r.temp3, 0xFF),
-        MOVI(r.temp1, 1), # current pos
+        CMPI(r.length, 0),
+        BEQ("sys_packet_tx_invalid_length"), # we need at least an address
+        LD(r.dest_addr, r.buf_ptr, 0), # dest addr
+        MOVI(r.buf_ptr, 1), # current pos
     L("_scwd_copy"),
-        LDR(r.temp4, r.temp1, "pb_data"),
-        ST(r.temp4, r.temp2, 0),
-        ADDI(r.temp2, r.temp2, 1),
-        ADDI(r.temp1, r.temp1, 1),
-        CMP(r.temp1, r.temp3),
+        LDR(r.copy_tmp, r.buf_ptr, "pb_data"),
+        ST(r.copy_tmp, r.dest_addr, 0),
+        ADDI(r.dest_addr, r.dest_addr, 1),
+        ADDI(r.buf_ptr, r.buf_ptr, 1),
+        CMP(r.buf_ptr, r.length),
         BNE("_scwd_copy"),
         J("sys_packet_tx_success"),
-
+    ])
+    r -= "dest_addr copy_tmp"
+    r += "R6:dest_code R4:dest_w"
+    fw.append([
     L("sys_cmd_jump_to_code"),
         # jump to some downloaded code
-        # TODO validate length
-        MOVR(r.temp1, "pb_data"),
-        LD(R0, r.temp1, 0), # dest addr
-        LD(R1, r.temp1, 1), # dest W
+        CMPI(r.length, 2),
+        BNE("sys_packet_tx_invalid_length"),
+        LD(r.dest_code, r.buf_ptr, 0),
+        LD(r.dest_w, r.buf_ptr, 1),
         # tell the host that we successfully got everything before we jump into
         # the app code
-        MOVI(R5, 0x0100),
+        MOVI(r.result_code, 0x0100),
         JAL(r.lr, "tx_packet"),
-        XCHW(R7, R1), # set new W and store current one
-        LD(R7, R7, 0), # get jump destination
+        XCHW(R7, r.dest_w), # set new W and store current one
+        LD(R7, R7, int(r.dest_code)), # get jump destination from current frame
         JR(R7, 0), # and jump to it
     ])
 
