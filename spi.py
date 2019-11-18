@@ -12,12 +12,11 @@ from boneless.arch.opcode import *
 #          when one is not already in progress.
 #          bit 15: 1 for write transaction, 0 for read transaction
 #           14-13: bus mode: 0 = previous, 1 = 1 bit, 2 = 2 bit, 3 = 4 bit
-#              12: chip select
+#              12: 1 if chip select should be deasserted at txn end
 #            11-0: transaction length
 #    Read: bit 15: 1 if transaction in progress, 0 otherwise. the transaction
 #                  FIFO is empty/full and the bus is idle iff this bit is 0
 #           14:13: current bus mode
-#              12: current chip select
 
 # 0x1: (W) Queue Write / (R) Receive Read/FIFO status
 # Write:      7-0: character to write on bus. only legal if in write mode.
@@ -85,10 +84,8 @@ class SimpleSPI(Elaboratable):
         r0_txn_active = SetReset(m, priority="set")
         r0_write_txn = Signal()
         r0_bus_mode = Signal(2, reset=1)
-        r0_cs = Signal(reset=1)
+        r0_deassert_cs = Signal()
         r0_txn_length = Signal(12)
-
-        m.d.sync += self.o_cs.eq(r0_cs)
 
         # handle the boneless bus.
         read_data = Signal(16) # it expects one cycle of read latency
@@ -100,7 +97,6 @@ class SimpleSPI(Elaboratable):
                     m.d.comb += [
                         read_data[15].eq(r0_txn_active.value),
                         read_data[13:15].eq(r0_bus_mode),
-                        read_data[12].eq(r0_cs),
                     ]
                 with m.Case(1): # receive read/FIFO status register
                     with m.If(r0_write_txn):
@@ -126,7 +122,7 @@ class SimpleSPI(Elaboratable):
                             r0_write_txn.eq(self.i_wdata[15]),
                             r0_bus_mode.eq(Mux(self.i_wdata[13:15] == 0,
                                 r0_bus_mode, self.i_wdata[13:15])),
-                            r0_cs.eq(self.i_wdata[12]),
+                            r0_deassert_cs.eq(self.i_wdata[12]),
                             r0_txn_length.eq(self.i_wdata[:12]),
                         ]
                 with m.Case(1): # tx queue register
@@ -145,10 +141,15 @@ class SimpleSPI(Elaboratable):
         with m.FSM("STOP"):
             with m.State("STOP"): # no transaction happening
                 with m.If(r0_txn_active.value):
+                    # automatically assert CS at start of transaction
+                    m.d.sync += self.o_cs.eq(0)
                     with m.If(r0_write_txn):
                         m.next = "WIDLE"
                     with m.Else():
                         m.next = "RIDLE"
+                with m.Elif(r0_deassert_cs):
+                    # deassert CS once transaction stops if asked
+                    m.d.sync += self.o_cs.eq(1)
 
             with m.State("WIDLE"): # write transaction, waiting for data
                 with m.If(fifo.r_rdy): # have we got some?

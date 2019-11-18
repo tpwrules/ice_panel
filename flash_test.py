@@ -20,13 +20,12 @@ def firmware():
         BS1("host_listen_wait"),
 
         # start transaction to turn on the chip
-        MOVI(r.data, (1<<15)+1), # write txn, length 1
+        MOVI(r.data, (1<<15)+(1<<12)+1), # write txn, length 1, deassert CS
         STXA(r.data, 4),
         MOVI(r.data, 0xAB),
         STXA(r.data, 5),
         JAL(r.lr, "txn_wait"),
-        MOVI(r.data, 1<<12),
-        STXA(r.data, 4),
+
         # wait a bunch of time for the chip to get back up
         MOVI(r.data, 255),
     L("powerup_wait"),
@@ -42,7 +41,7 @@ def firmware():
         JAL(r.lr, "txn_wait"),
 
         # it responds with three bytes, which we forward to the UART
-        MOVI(r.data, 3), # read txn, length 3
+        MOVI(r.data, (1<<12)+3), # read txn, length 3, deassert CS
         STXA(r.data, 4),
         JAL(r.lr, "read_fifo"),
         MOV(r.rd0, r.data),
@@ -50,10 +49,6 @@ def firmware():
         MOV(r.rd1, r.data),
         JAL(r.lr, "read_fifo"),
         MOV(r.rd2, r.data),
-
-        # deassert CS
-        MOVI(r.data, 1<<12),
-        STXA(r.data, 4),
 
         MOV(r.data, r.rd0),
         JAL(r.lr, "uart_tx"),
