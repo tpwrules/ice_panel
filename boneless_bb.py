@@ -13,6 +13,7 @@ from hub75 import PanelDescription, GammaParameters, FramebufferedHUB75Driver
 from pll import PLL
 from spram import SPRAM
 import uart
+import spi
 
 
 class BonelessLED(Elaboratable):
@@ -31,11 +32,13 @@ class BonelessLED(Elaboratable):
 
         self.uart = uart.SimpleUART(
             default_divisor=uart.calculate_divisor(12e6, 115200))
+        self.spi = spi.SimpleSPI()
 
     def elaborate(self, platform):
         platform.add_resources(pmod_resources.hub75_pmod)
 
         uart_pins = platform.request("uart")
+        spi_pins = platform.request("spi_flash_1x")
 
         m = Module()
         m.submodules.panel = panel = self.panel
@@ -45,6 +48,7 @@ class BonelessLED(Elaboratable):
         m.submodules.cpu_rom_w = cpu_rom_w = self.cpu_rom.write_port()
         m.submodules.cpu_ram = cpu_ram = self.cpu_ram
         m.submodules.uart = uart = self.uart
+        m.submodules.spi = spi = self.spi
 
         # split up main bus
         rom_en = Signal()
@@ -84,10 +88,20 @@ class BonelessLED(Elaboratable):
 
         # split up the external bus
         uart_en = Signal()
+        spi_en = Signal()
         panel_en = Signal()
+        addr = cpu_core.o_bus_addr
         m.d.comb += [
-            uart_en.eq(cpu_core.o_bus_addr[-1] == 0),
+            uart_en.eq((addr[-1] == 0) & (addr[2] == 0)),
+            spi_en.eq((addr[-1] == 0) & (addr[2] == 1)),
             panel_en.eq(cpu_core.o_bus_addr[-1] == 1),
+        ]
+        # remember what was active so we can redirect reads appropriately
+        uart_was_en = Signal()
+        spi_was_en = Signal()
+        m.d.sync += [
+            uart_was_en.eq(uart_en),
+            spi_was_en.eq(spi_en),
         ]
 
         # hook up the CPU's external bus to the panel engine
@@ -103,13 +117,32 @@ class BonelessLED(Elaboratable):
             uart.i_we.eq(cpu_core.o_ext_we & uart_en),
             uart.i_addr.eq(cpu_core.o_bus_addr[:2]),
             uart.i_wdata.eq(cpu_core.o_ext_data),
-            cpu_core.i_ext_data.eq(uart.o_rdata),
         ]
-
         m.d.comb += [
             uart.i_rx.eq(uart_pins.rx),
             uart_pins.tx.eq(uart.o_tx),
         ]
+
+        # and the SPI
+        m.d.comb += [
+            spi.i_re.eq(cpu_core.o_ext_re & spi_en),
+            spi.i_we.eq(cpu_core.o_ext_we & spi_en),
+            spi.i_addr.eq(cpu_core.o_bus_addr[:1]),
+            spi.i_wdata.eq(cpu_core.o_ext_data),
+        ]
+        m.d.comb += [
+            spi_pins.clk.eq(spi.o_clk),
+            spi_pins.cs.eq(~spi.o_cs),
+            spi_pins.mosi.eq(spi.o_mosi),
+            spi.i_miso.eq(spi_pins.miso),
+        ]
+
+        with m.If(uart_was_en):
+            m.d.comb += cpu_core.i_ext_data.eq(uart.o_rdata)
+        with m.Elif(spi_was_en):
+            m.d.comb += cpu_core.i_ext_data.eq(spi.o_rdata)
+
+        
 
         return m
 
