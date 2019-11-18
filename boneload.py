@@ -65,6 +65,30 @@
 #   result codes: CRC result, invalid length
 #   purpose: calculate CRC-16/KERMIT of arbitrary memory region
 
+# command 6: flash transaction immediate
+#   length 1-n
+#   parameter words: engine command, data words
+#   result codes: success, read result, invalid length
+#   purpose: perform a transaction with the spi flash. if in write mode,
+#       write data words (each of which is two little endian bytes) to spi
+#       in accordance with control word and return success once finished.
+#       otherwise, read data words from spi and send them back in a read data
+#       response. txn length is controlled by engine command. max txn length
+#       is 2*(max length-1) for both read and write
+
+# command 7: flash transaction
+#   length 2
+#   parameter words: engine command, buffer address
+#   result codes: success, invalid length
+#   purpose: perform a transaction with spi flash with buffer at an arbitrary
+#       location instead of implied in command.
+
+# ENGINE COMMAND FORMAT
+#          bit 15: 1 for write transaction, 0 for read transaction
+#           14-13: bus mode: 0 = previous, 1 = 1 bit, 2 = 2 bit, 3 = 4 bit
+#              12: 1 if chip select should be deasserted at txn end
+#            11-0: transaction length
+
 # results
 # result 1: success
 #   length: 0
@@ -300,7 +324,87 @@ def _bfw_tx_packet(uart_addr):
 
     return fw
 
-def _bfw_main(uart_addr):
+# perform a flash transaction using spi engine.
+# on entry (in caller window):
+# R7: return address
+# R5: engine command:
+#          bit 15: 1 for write transaction, 0 for read transaction
+#           14-13: bus mode: 0 = previous, 1 = 1 bit, 2 = 2 bit, 3 = 4 bit
+#              12: 1 if chip select should be deasserted at txn end
+#            11-0: transaction length
+# R4: buffer address. note that it is in words! low byte is sent first.
+# on exit (in our window):
+# nothing of significance
+def _bfw_flash_txn(spi_addr):
+    # generate random prefix so that we effectively can make local labels
+    lp = "_{}_".format(random.randrange(2**32))
+    r = RegisterManager("R7:lr R6:fp R5:curr_addr R4:length R3:status "
+        "R2:command R1:curr_word R0:curr_byte")
+    return [
+        # set up register frame and load parameters
+        LDW(r.fp, -8),
+        LD(r.command, r.fp, 5),
+        LD(r.curr_addr, r.fp, 4),
+
+        # get length so we can count out the bytes we store/retrieve
+        ANDI(r.length, r.command, 0xFFF),
+        # write the command to the engine
+        STXA(r.command, spi_addr+0),
+        ANDI(r.status, r.command, 0x8000), # read or write command?
+        BS0(lp+"rd_cmd"),
+
+    L(lp+"wr_cmd"),
+        LD(r.curr_word, r.curr_addr, 0), # get another word
+        ANDI(r.curr_byte, r.curr_word, 0xFF), # write the low byte
+        JAL(r.lr, lp+"wr_fifo"),
+        CMPI(r.length, 1), # could be doing an odd number of bytes
+        BEQ(lp+"wr_done"),
+        SRLI(r.curr_byte, r.curr_word, 8), # then the high byte
+        JAL(r.lr, lp+"wr_fifo"),
+        ADDI(r.curr_addr, r.curr_addr, 1),
+        SUBI(r.length, r.length, 2), # just sent 2 bytes
+        BNZ(lp+"wr_cmd"),
+    L(lp+"wr_done"),
+        # we have to wait for the transaction to finish...
+        LDXA(r.status, spi_addr+0),
+        ANDI(r.status, r.status, 0x8000),
+        BS1(lp+"wr_done"),
+        # fallthrough
+    L(lp+"ret"),
+        # take down register frame and return
+        ADJW(8),
+        JR(R7, 0), # R7 in caller's window
+    L(lp+"wr_fifo"),
+        # we have to wait for fifo space
+        LDXA(r.status, spi_addr+1),
+        ROLI(r.status, r.status, 1),
+        BS1(lp+"wr_fifo"),
+        STXA(r.curr_byte, spi_addr+1),
+        JR(r.lr, 0),
+
+    L(lp+"rd_cmd"),
+        JAL(r.lr, lp+"rd_fifo"), # get a new byte
+        MOV(r.curr_word, r.curr_byte), # save it as the low one
+        ST(r.curr_word, r.curr_addr, 0), # store it in case we branch away below
+        CMPI(r.length, 1), # could be doing an odd number of bytes
+        BEQ(lp+"ret"), # don't have to do anything fancy after reading
+        JAL(r.lr, lp+"rd_fifo"), # then another byte
+        SLLI(r.curr_byte, r.curr_byte, 8), # to be the high one
+        OR(r.curr_word, r.curr_word, r.curr_byte),
+        ST(r.curr_word, r.curr_addr, 0),
+        ADDI(r.curr_addr, r.curr_addr, 1),
+        SUBI(r.length, r.length, 2), # just received 2 bytes
+        BNZ(lp+"rd_cmd"),
+        J(lp+"ret"), # nothing else needs to be done
+    L(lp+"rd_fifo"),
+        # we have to wait for something to be in the fifo
+        LDXA(r.curr_byte, spi_addr+1),
+        ROLI(r.curr_byte, r.curr_byte, 1),
+        BS1(lp+"rd_fifo"),
+        JR(r.lr, 0),
+    ]
+
+def _bfw_main(uart_addr, spi_addr):
     max_length = 16 # adjust to fill memory
     fw = []
 
@@ -334,6 +438,10 @@ def _bfw_main(uart_addr):
         BEQ("sys_cmd_read_data"),
         CMPI(r.command, 4),
         BEQ("sys_cmd_jump_to_code"),
+        CMPI(r.command, 6),
+        BEQ("sys_cmd_flash_txn_imm"),
+        CMPI(r.command, 7),
+        BEQ("sys_cmd_flash_txn"),
         # oh no, we don't know what the command is
         # fortunately, a result of 0 also = bad command
         J("sys_packet_tx_issue"),
@@ -376,7 +484,7 @@ def _bfw_main(uart_addr):
         J("tx_packet"), # LR is set to return to sys_packet_rx
     ])
     r -= "ident_info"
-    r += "R6:dest_addr R3:copy_tmp"
+    r += "R6:dest_addr R4:copy_tmp"
     fw.append([
     L("sys_cmd_write_data"),
         # write some data to some address
@@ -434,6 +542,56 @@ def _bfw_main(uart_addr):
         LD(R7, R7, int(r.dest_code)), # get jump destination from current frame
         JR(R7, 0), # and jump to it
     ])
+    r -= "dest_code dest_w result_code"
+    r += "R6:is_write R5:engine_cmd R4:txn_buf R3:txn_length"
+    fw.append([
+    L("sys_cmd_flash_txn_imm"),
+        # do a flash transaction using command data
+        CMPI(r.length, 0),
+        BEQ("sys_packet_tx_invalid_length"), # we need at least a command
+        LD(r.engine_cmd, r.buf_ptr, 0),
+        # make sure we don't transact into uncharted territory
+        ANDI(r.txn_length, r.engine_cmd, 0xFFF),
+        CMPI(r.txn_length, 2*(max_length-1)),
+        BGTU("sys_packet_tx_invalid_length"),
+        MOV(r.txn_buf, r.buf_ptr),
+        # if this is a write transaction, the buffer starts 1 in
+        ANDI(r.is_write, r.engine_cmd, 0x8000),
+        BS0("_scfti_rd"),
+        ADDI(r.txn_buf, r.txn_buf, 1),
+    L("_scfti_rd"),
+        JAL(r.lr, "flash_txn"), # do the operation
+    ])
+    r -= "engine_cmd"
+    r += "R5:result_code"
+    fw.append([
+        # ensure we return back to the main loop (since we overwrote LR)
+        MOVR(r.lr, "sys_packet_rx"),
+        ANDI(r.is_write, r.is_write, 0x8000),
+        BS1("sys_packet_tx_success"),
+        # if this is read, we need to send the data back.
+        # calculate the respone length, in words.
+        ADDI(r.result_code, r.txn_length, 1), # round up
+        SRLI(r.result_code, r.result_code, 1),
+        ORI(r.result_code, r.result_code, 4<<8), # set read result type
+        J("tx_packet"), # and do it
+    ])
+    r -= "is_write txn_buf txn_length result_code"
+    r += "R5:engine_cmd R4:txn_buf"
+    fw.append([
+    L("sys_cmd_flash_txn"),
+        # do a flash transaction using data in RAM
+        CMPI(r.length, 2),
+        BNE("sys_packet_tx_invalid_length"),
+        LD(r.engine_cmd, r.buf_ptr, 1),
+        LD(r.txn_buf, r.buf_ptr, 1),
+        JAL(r.lr, "flash_txn"),
+        # restore LR to main loop since we just used it above
+        MOVR(r.lr, "sys_packet_rx"),
+        J("sys_packet_tx_success"),
+    ])
+    r -= "engine_cmd"
+    r += "R5:result_code"
 
     fw.append([ # declare subroutines
     L("calc_crc"),
@@ -442,6 +600,8 @@ def _bfw_main(uart_addr):
         _bfw_rx_packet(uart_addr, max_length),
     L("tx_packet"),
         _bfw_tx_packet(uart_addr),
+    L("flash_txn"),
+        _bfw_flash_txn(spi_addr),
     ])
 
     # set up labels for packet buffer and reserve space so that we ensure we
@@ -457,8 +617,8 @@ def _bfw_main(uart_addr):
 
     return fw
 
-def boneload_fw(uart_addr=0):
-    return Instr.assemble(_bfw_main(uart_addr))
+def boneload_fw(uart_addr=0, spi_addr=4):
+    return Instr.assemble(_bfw_main(uart_addr, spi_addr))
 
 # implementation taken from crcany
 def _crc(words):
@@ -566,6 +726,42 @@ def _bl_jump_to_code(ser, addr, w):
     if r != 1:
         raise Exception("huh? {} {}".format(r, p))
 
+def _bl_flash_txn_imm(ser, max_length, *,
+        write_data=None, read_len=None, deassert_cs=False):
+    if write_data is not None and read_len is not None:
+        raise ValueError("can only write or read, not both")
+    if write_data is None and read_len is None:
+        raise ValueError("must write or read, not neither")
+    if write_data is not None:
+        # convert data from bytes to words
+        write_data = list(write_data)
+        engine_cmd = (1<<15) + (int(deassert_cs)<<12) + len(write_data)
+        if len(write_data) % 2 == 1:
+            write_data.append(0)
+        write_words = [engine_cmd]
+        for l, h in zip(write_data[::2], write_data[1::2]):
+            write_words.append((h<<8)+l)
+        if len(write_words) > max_length:
+            raise ValueError("too many words")
+        r, p = _bl_command(ser, 6, write_words)
+        if r != 1:
+            raise Exception("huh? {} {}".format(r, p))
+    elif read_len is not None:
+        engine_cmd = (int(deassert_cs)<<12) + read_len
+        print(engine_cmd, hex(engine_cmd), read_len)
+        r, p = _bl_command(ser, 6, [engine_cmd])
+        if r != 4:
+            raise Exception("huh? {} {}".format(r, p))
+        print(r, p)
+        # convert from words to bytes
+        read_data = []
+        for w in p:
+            read_data.append(w&0xFF)
+            read_data.append(w>>8)
+        if read_len % 2 == 1:
+            read_data = read_data[:-1]
+        return read_data
+
 # boneload the given firmware to the given port. firmware should be a list of
 # integers (each one is one word) and the port should be a string that can be
 # given to pyserial.
@@ -593,6 +789,16 @@ def boneload(firmware, port):
     for a, b in zip(firmware, got_firmware):
         if a != b:
             raise Exception("verification failed!")
+    print("Awakening flash...")
+    _bl_flash_txn_imm(ser, ident[2], write_data=[0xAB], deassert_cs=True)
+    # it takes a couple microseconds to wake up, which parsing this comment
+    # has already wasted
+    print("Reading flash ID...")
+    _bl_flash_txn_imm(ser, ident[2], write_data=[0x9F])
+    fid = _bl_flash_txn_imm(ser, ident[2], read_len=3, deassert_cs=True)
+    for x in fid:
+        print(hex(x), end=" ")
+    print()
     print("Beginning execution...")
     _bl_jump_to_code(ser, 0, 0xFFF)
     print("Complete!")

@@ -24,11 +24,11 @@ class BonelessLED(Elaboratable):
         self.panel = FramebufferedHUB75Driver(self.pd, led_domain=led_domain,
            gamma_params=self.gp)
 
-        self.cpu_rom = Memory(width=16, depth=256,
-            init=boneload.boneload_fw(uart_addr=0))
+        self.cpu_rom = Memory(width=16, depth=512,
+            init=boneload.boneload_fw(uart_addr=0, spi_addr=4))
         self.cpu_ram = SPRAM()
         self.cpu_core = CoreFSM(alsru_cls=ALSRU_4LUT,
-            reset_pc=0xFF00, reset_w=0xFFF8)
+            reset_pc=0xFE00, reset_w=0xFFF8)
 
         self.uart = uart.SimpleUART(
             default_divisor=uart.calculate_divisor(12e6, 115200))
