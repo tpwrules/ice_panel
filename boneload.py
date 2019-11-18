@@ -330,6 +330,8 @@ def _bfw_main(uart_addr):
         BEQ("sys_cmd_identify"),
         CMPI(r.command, 2),
         BEQ("sys_cmd_write_data"),
+        CMPI(r.command, 3),
+        BEQ("sys_cmd_read_data"),
         CMPI(r.command, 4),
         BEQ("sys_cmd_jump_to_code"),
         # oh no, we don't know what the command is
@@ -392,6 +394,30 @@ def _bfw_main(uart_addr):
         J("sys_packet_tx_success"),
     ])
     r -= "dest_addr copy_tmp"
+    r += "R6:src_addr R4:copy_tmp"
+    fw.append([
+    L("sys_cmd_read_data"),
+        # read some data from some address
+        CMPI(r.length, 2),
+        BNE("sys_packet_tx_invalid_length"),
+        LD(r.src_addr, r.buf_ptr, 0), # src address
+        LD(r.length, r.buf_ptr, 1), # number of words to copy
+        # which is the number of words returned (plus result type 4)
+        ORI(r.result_code, r.length, 4<<8),
+        CMPI(r.length, max_length),
+        BGTU("sys_packet_tx_invalid_length"),
+        MOVI(r.buf_ptr, 0),
+    L("_scrd_copy"),
+        LD(r.copy_tmp, r.src_addr, 0),
+        STR(r.copy_tmp, r.buf_ptr, "pb_data"),
+        ADDI(r.src_addr, r.src_addr, 1),
+        ADDI(r.buf_ptr, r.buf_ptr, 1),
+        CMP(r.buf_ptr, r.length),
+        BNE("_scrd_copy"),
+        # result code already set before the loop
+        J("tx_packet"),
+    ])
+    r -= "src_addr copy_tmp"
     r += "R6:dest_code R4:dest_w"
     fw.append([
     L("sys_cmd_jump_to_code"),
@@ -523,6 +549,18 @@ def _bl_write_data(ser, addr, data, max_len):
             raise Exception("huh? {} {}".format(r, p))
         written += to_write
 
+def _bl_read_data(ser, addr, read_len, max_len):
+    num_read = 0
+    read = []
+    while num_read < read_len:
+        to_read = min(max_len, read_len-num_read)
+        r, p = _bl_command(ser, 3, (addr+num_read, to_read))
+        if r != 4:
+            raise Exception("huh? {} {}".format(r, p))
+        read.extend(p)
+        num_read += to_read
+    return read
+
 def _bl_jump_to_code(ser, addr, w):
     r, p = _bl_command(ser, 4, [addr, w])
     if r != 1:
@@ -550,6 +588,11 @@ def boneload(firmware, port):
     print("Identified! Board ID=0x{:02X}, max length={}".format(*ident[1:]))
     print("Downloading program...")
     _bl_write_data(ser, 0, firmware, ident[2])
+    print("Verifying program...")
+    got_firmware = _bl_read_data(ser, 0, len(firmware), ident[2])
+    for a, b in zip(firmware, got_firmware):
+        if a != b:
+            raise Exception("verification failed!")
     print("Beginning execution...")
     _bl_jump_to_code(ser, 0, 0xFFF)
     print("Complete!")
