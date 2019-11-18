@@ -71,7 +71,7 @@ class SimpleSPI(Elaboratable):
 
         # SPI signals
         self.o_clk = Signal()
-        self.o_cs = Signal(reset=1) # inverted, like usual
+        self.o_cs = Signal() # inverted, like usual
         self.o_mosi = Signal()
         self.i_miso = Signal()
 
@@ -85,24 +85,14 @@ class SimpleSPI(Elaboratable):
         r0_txn_active = SetReset(m, priority="set")
         r0_write_txn = Signal()
         r0_bus_mode = Signal(2, reset=1)
-        r0_cs = Signal()
+        r0_cs = Signal(reset=1)
         r0_txn_length = Signal(12)
 
         m.d.sync += self.o_cs.eq(r0_cs)
 
         # handle the boneless bus.
         read_data = Signal(16) # it expects one cycle of read latency
-        read_output = Signal(16)
-        # but the FIFO has that too, so we need to incorporate its output if
-        # asked to.
-        read_from_fifo = Signal()
-        with m.If(read_from_fifo):
-            m.d.comb += self.o_rdata.eq(
-                Cat(fifo.r_data[1:8], read_output[8:15], fifo.r_data[0]))
-            m.d.sync += read_from_fifo.eq(0)
-        with m.Else():
-            m.d.comb += self.o_rdata.eq(read_output)
-        m.d.sync += read_output.eq(read_data)
+        m.d.sync += self.o_rdata.eq(read_data)
 
         with m.If(self.i_re):
             with m.Switch(self.i_addr):
@@ -120,21 +110,23 @@ class SimpleSPI(Elaboratable):
                         # interested in if the read side of the fifo is empty
                         m.d.comb += read_data[14].eq(~fifo.r_rdy)
                         with m.If(fifo.r_rdy):
-                            # if it is, read it
-                            m.d.comb += fifo.r_en.eq(1)
-                            # and note that next cycle we need to mux in the
-                            # output
-                            m.d.sync += read_from_fifo.eq(1)
+                            m.d.comb += [
+                                fifo.r_en.eq(1), # if it is, acknowledge it
+                                # and give the user the current byte
+                                read_data[15].eq(fifo.r_data[0]),
+                                read_data[:7].eq(fifo.r_data[1:])
+                            ]
         with m.Elif(self.i_we):
             with m.Switch(self.i_addr):
                 with m.Case(0): # transaction start register
                     with m.If(~r0_txn_active.value):
-                        m.d.comb += r0_txn_active.set.eq(1)
+                        with m.If(self.i_wdata[:12] != 0):
+                            m.d.comb += r0_txn_active.set.eq(1)
                         m.d.sync += [
                             r0_write_txn.eq(self.i_wdata[15]),
                             r0_bus_mode.eq(Mux(self.i_wdata[13:15] == 0,
                                 r0_bus_mode, self.i_wdata[13:15])),
-                            r0_cs.eq(self.i_wdata[13]),
+                            r0_cs.eq(self.i_wdata[12]),
                             r0_txn_length.eq(self.i_wdata[:12]),
                         ]
                 with m.Case(1): # tx queue register
@@ -160,17 +152,14 @@ class SimpleSPI(Elaboratable):
 
             with m.State("WIDLE"): # write transaction, waiting for data
                 with m.If(fifo.r_rdy): # have we got some?
-                    # yes, go read it
+                    # yes, acknowledge it
                     m.d.comb += fifo.r_en.eq(1)
-                    m.next = "WGET"
-
-            with m.State("WGET"):
-                # copy the FIFO byte into our buffer and start up the counters
-                m.d.sync += [
-                    curr_buf.eq(fifo.r_data),
-                    bit_ctr.eq(7),
-                ]
-                m.next = "WOUTA"
+                    m.d.sync += [ # and prepare to write the byte
+                        curr_buf.eq(fifo.r_data),
+                        bit_ctr.eq(7),
+                        r0_txn_length.eq(r0_txn_length-1),
+                    ]
+                    m.next = "WOUTA"
 
             with m.State("WOUTA"):
                 # the flash latches in the new value on the rising edge.
@@ -182,7 +171,8 @@ class SimpleSPI(Elaboratable):
                 m.next = "WOUTB"
 
             with m.State("WOUTB"):
-                # now that the value is output, we can latch it
+                # now that the value is output, we can raise the clock and the
+                # flash will latch it in.
                 m.d.comb += [
                     self.o_mosi.eq(curr_buf[-1]),
                     self.o_clk.eq(1),
@@ -192,7 +182,6 @@ class SimpleSPI(Elaboratable):
                         m.d.comb += r0_txn_active.reset.eq(1)
                         m.next = "STOP"
                     with m.Else():
-                        m.d.sync += r0_txn_length.eq(r0_txn_length-1)
                         m.next = "WIDLE"
                 with m.Else():
                     m.d.sync += bit_ctr.eq(bit_ctr-1)
@@ -201,8 +190,9 @@ class SimpleSPI(Elaboratable):
 
             with m.State("RIDLE"): # read transaction, waiting for space
                 with m.If(fifo.w_rdy): # have we got some?
-                    # yes, go read from the device
+                    # yes, start reading a byte from the flash
                     m.d.sync += bit_ctr.eq(7)
+                    m.d.sync += r0_txn_length.eq(r0_txn_length-1)
                     m.next = "RINA"
 
             with m.State("RINA"):
@@ -224,7 +214,6 @@ class SimpleSPI(Elaboratable):
                         m.d.comb += r0_txn_active.reset.eq(1)
                         m.next = "STOP"
                     with m.Else():
-                        m.d.sync += r0_txn_length.eq(r0_txn_length-1)
                         m.next = "RIDLE"
                 with m.Else():
                     m.d.sync += bit_ctr.eq(bit_ctr-1)
