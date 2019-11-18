@@ -533,6 +533,7 @@ def _bl_jump_to_code(ser, addr, w):
 # given to pyserial.
 def boneload(firmware, port):
     import serial
+    firmware = Instr.assemble(firmware)
     print("Connecting...")
     ser = serial.Serial(port, 115200, timeout=0.1)
     print("Identifying (reset board please)...")
@@ -548,7 +549,7 @@ def boneload(firmware, port):
 
     print("Identified! Board ID=0x{:02X}, max length={}".format(*ident[1:]))
     print("Downloading program...")
-    _bl_write_data(ser, 0, Instr.assemble(firmware), ident[2])
+    _bl_write_data(ser, 0, firmware, ident[2])
     print("Beginning execution...")
     _bl_jump_to_code(ser, 0, 0xFFF)
     print("Complete!")
