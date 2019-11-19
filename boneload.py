@@ -466,8 +466,8 @@ def _bfw_main(uart_addr, spi_addr, mini):
         LDW(r.fp, 0),
         JAL(r.lr, "rx_packet"),
         LD(r.result_code, r.fp, -8+0),
-        CMPI(r.result_code, 3),
-        BEQ("flash_boot"),
+        CMPI(r.result_code, 0),
+        BNE("flash_boot"),
         J("spr_got"),
     L("sys_packet_rx"),
         LDW(r.fp, 0), # fetch window so we can get return values
@@ -887,7 +887,7 @@ def boneload(firmware, port):
         except Timeout:
             pass
 
-    if ident[0] != 1:
+    if ident[0] != 0x8001:
         raise Exception("incompatible version {}".format(ident[0]))
 
     print("Identified! Board ID=0x{:02X}, max length={}".format(*ident[1:]))
