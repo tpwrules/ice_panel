@@ -32,7 +32,7 @@ class BonelessLED(Elaboratable):
 
         self.uart = uart.SimpleUART(
             default_divisor=uart.calculate_divisor(12e6, 115200))
-        self.spi = spi.SimpleSPI()
+        self.spi = spi.SimpleSPI(fifo_depth=512)
 
     def elaborate(self, platform):
         platform.add_resources(pmod_resources.hub75_pmod)

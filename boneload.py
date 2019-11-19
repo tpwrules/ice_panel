@@ -359,11 +359,11 @@ def _bfw_flash_txn(spi_addr):
     L(lp+"wr_cmd"),
         LD(r.curr_word, r.curr_addr, 0), # get another word
         ANDI(r.curr_byte, r.curr_word, 0xFF), # write the low byte
-        JAL(r.lr, lp+"wr_fifo"),
+        STXA(r.curr_byte, spi_addr+1),
         CMPI(r.length, 1), # could be doing an odd number of bytes
         BEQ(lp+"wr_done"),
         SRLI(r.curr_byte, r.curr_word, 8), # then the high byte
-        JAL(r.lr, lp+"wr_fifo"),
+        STXA(r.curr_byte, spi_addr+1),
         ADDI(r.curr_addr, r.curr_addr, 1),
         SUBI(r.length, r.length, 2), # just sent 2 bytes
         BNZ(lp+"wr_cmd"),
@@ -377,13 +377,6 @@ def _bfw_flash_txn(spi_addr):
         # take down register frame and return
         ADJW(8),
         JR(R7, 0), # R7 in caller's window
-    L(lp+"wr_fifo"),
-        # we have to wait for fifo space
-        LDXA(r.status, spi_addr+1),
-        ROLI(r.status, r.status, 1),
-        BS1(lp+"wr_fifo"),
-        STXA(r.curr_byte, spi_addr+1),
-        JR(r.lr, 0),
 
     L(lp+"rd_cmd"),
         JAL(r.lr, lp+"rd_fifo"), # get a new byte
