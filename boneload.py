@@ -45,19 +45,19 @@
 #   purpose: writes words to arbitrary memory address. note that boneload lives
 #   from $FF00 to $FFFF, and overwriting it would be bad.
 
-# command 3: read data
-#   length: 2
-#   parameter words: source address, source length (up to max length)
-#   result codes: read result, invalid length
-#   purpose: reads words from arbitrary memory address.
-
-# command 4: jump to code
+# command 3: jump to code
 #   length: 2
 #   parameter words: destination address, new W address
 #   result codes: success, execution complete, invalid length
 #   purpose: jump to bootloaded code. W is loaded before the jump. entering into
 #       the code, R7 will have return address and R6 will have previous W.
 #       succese is before jump, execution complete is sent if jump returns.
+
+# command 4: read data
+#   length: 2
+#   parameter words: source address, source length (up to max length)
+#   result codes: read result, invalid length
+#   purpose: reads words from arbitrary memory address.
 
 # command 5: calculate CRC
 #   length 2:
@@ -482,22 +482,22 @@ def _bfw_main(uart_addr, spi_addr, mini):
         LDR(r.command, r.result_code, "pb_cmdresp"), # (we know result_code = 0)
         ANDI(r.length, r.command, 0xFF),
         SRLI(r.command, r.command, 8),
-        CMPI(r.command, 1),
+        SUBI(r.command, r.command, 1), # command 1
         BEQ("sys_cmd_identify"),
-        CMPI(r.command, 2),
+        SUBI(r.command, r.command, 1), # command 2
         BEQ("sys_cmd_write_data"),
-        CMPI(r.command, 4),
+        SUBI(r.command, r.command, 1), # command 3
         BEQ("sys_cmd_jump_to_code"),
     ])
     if not mini:
         fw.append([
-            CMPI(r.command, 3),
+            SUBI(r.command, r.command, 1), # command 4
             BEQ("sys_cmd_read_data"),
-            CMPI(r.command, 5),
+            SUBI(r.command, r.command, 1), # command 5
             BEQ("sys_cmd_crc"),
-            CMPI(r.command, 6),
+            SUBI(r.command, r.command, 1), # command 6
             BEQ("sys_cmd_flash_txn_imm"),
-            CMPI(r.command, 7),
+            SUBI(r.command, r.command, 1), # command 7
             BEQ("sys_cmd_flash_txn"),
         ])
     fw.append([
@@ -805,22 +805,22 @@ def _bl_write_data(ser, addr, data, max_len):
             raise Exception("huh? {} {}".format(r, p))
         written += to_write
 
+def _bl_jump_to_code(ser, addr, w):
+    r, p = _bl_command(ser, 3, [addr, w])
+    if r != 1:
+        raise Exception("huh? {} {}".format(r, p))
+
 def _bl_read_data(ser, addr, read_len, max_len):
     num_read = 0
     read = []
     while num_read < read_len:
         to_read = min(max_len, read_len-num_read)
-        r, p = _bl_command(ser, 3, (addr+num_read, to_read))
+        r, p = _bl_command(ser, 4, (addr+num_read, to_read))
         if r != 4:
             raise Exception("huh? {} {}".format(r, p))
         read.extend(p)
         num_read += to_read
     return read
-
-def _bl_jump_to_code(ser, addr, w):
-    r, p = _bl_command(ser, 4, [addr, w])
-    if r != 1:
-        raise Exception("huh? {} {}".format(r, p))
 
 def _bl_crc(ser, addr, crc_len):
     r, p = _bl_command(ser, 5, [addr, crc_len])
