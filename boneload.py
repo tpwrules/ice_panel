@@ -346,10 +346,13 @@ def _bfw_flash_txn(spi_addr):
         LD(r.command, r.fp, 5),
         LD(r.curr_addr, r.fp, 4),
 
-        # get length so we can count out the bytes we store/retrieve
-        ANDI(r.length, r.command, 0xFFF),
         # write the command to the engine
         STXA(r.command, spi_addr+0),
+        # get length so we can count out the bytes we store/retrieve
+        ANDI(r.length, r.command, 0xFFF),
+        # if the length is zero, we still want to have written the command to
+        # configure the mode. but don't bother doing anything else.
+        BZ1(lp+"ret"),
         ANDI(r.status, r.command, 0x8000), # read or write command?
         BS0(lp+"rd_cmd"),
 
@@ -777,11 +780,9 @@ def _bl_flash_txn_imm(ser, max_length, *,
             raise Exception("huh? {} {}".format(r, p))
     elif read_len is not None:
         engine_cmd = (int(deassert_cs)<<12) + read_len
-        print(engine_cmd, hex(engine_cmd), read_len)
         r, p = _bl_command(ser, 6, [engine_cmd])
         if r != 4:
             raise Exception("huh? {} {}".format(r, p))
-        print(r, p)
         # convert from words to bytes
         read_data = []
         for w in p:
@@ -811,7 +812,7 @@ def boneload(firmware, port):
     import serial
     firmware = Instr.assemble(firmware)
     print("Connecting...")
-    ser = serial.Serial(port, 115200, timeout=0.1)
+    ser = serial.Serial(port, 115200, timeout=0.5)
     print("Identifying (reset board please)...")
     while True:
         try:
@@ -824,30 +825,76 @@ def boneload(firmware, port):
         raise Exception("incompatible version {}".format(ident[0]))
 
     print("Identified! Board ID=0x{:02X}, max length={}".format(*ident[1:]))
-    print("Awakening flash...")
-    _bl_flash_txn_imm(ser, ident[2], write_data=[0xAB], deassert_cs=True)
-    print("Writing command...")
-    _bl_write_data(ser, 343, [0x9F], ident[2])
-    print("Executing flash command...")
-    _bl_flash_txn(ser, 343, write_len=1)
-    _bl_flash_txn(ser, 343, read_len=3, deassert_cs=True)
-    print(_bl_read_data(ser, 343, 2, ident[2]))
-    print("Downloading program...")
+    print("Downloading program to RAM...")
     _bl_write_data(ser, 0, firmware, ident[2])
-    print("Verifying program...")
+    print("Verifying RAM...")
     correct_crc = _crc(firmware)
     calc_crc = _bl_crc(ser, 0, len(firmware))
     if calc_crc != correct_crc:
         raise Exception("verification failed!", calc_crc, correct_crc)
 
+    print("Awakening flash...")
+    _bl_flash_txn_imm(ser, ident[2], write_data=[0xAB], deassert_cs=True)
     # it takes a couple microseconds to wake up, which parsing this comment
     # has already wasted
     print("Reading flash ID...")
     _bl_flash_txn_imm(ser, ident[2], write_data=[0x9F])
     fid = _bl_flash_txn_imm(ser, ident[2], read_len=3, deassert_cs=True)
+    print("it is: ", end="")
     for x in fid:
         print(hex(x), end=" ")
     print()
+    
+    def _flash_wait():
+        # wait for BUSY to be off.
+        # start reading BUSY register
+        _bl_flash_txn_imm(ser, ident[2], write_data=[0x05])
+        while True:
+            # read its current value
+            status = _bl_flash_txn_imm(ser, ident[2], read_len=1)[0]
+            if status & 1 == 0:
+                break
+        # deassert CS and finish command
+        _bl_flash_txn_imm(ser, ident[2], write_data=[], deassert_cs=True)
+
+    print("Erasing flash sectors...")
+    sector_size = 4096
+    num_sectors = (len(firmware)*2+sector_size-1)//sector_size # round up
+    for sector in range(num_sectors):
+        # enable write access
+        _bl_flash_txn_imm(ser, ident[2], write_data=[0x06], deassert_cs=True)
+        # do the erase
+        addr = ((sector+32)*sector_size).to_bytes(3, byteorder="big")
+        _bl_flash_txn_imm(ser, ident[2],
+            write_data=[0x20, *addr], deassert_cs=True)
+        # and wait for it to finish
+        _flash_wait()
+
+    print("Programming flash pages...")
+    page_size = 256
+    num_pages = (len(firmware)*2+page_size-1)//page_size # round up
+    for page in range(num_pages):
+        # enable write access
+        _bl_flash_txn_imm(ser, ident[2], write_data=[0x06], deassert_cs=True)
+        # start program operation
+        addr = ((page+512)*page_size).to_bytes(3, byteorder="big")
+        _bl_flash_txn_imm(ser, ident[2], write_data=[0x02, *addr])
+        # send bytes from RAM to flash. remember that the flash is in bytes
+        # and we count in words.
+        _bl_flash_txn(ser, page*128,
+            write_len=min((len(firmware)-(page*128))*2, 256), deassert_cs=True)
+        _flash_wait()
+
+    print("Reloading flash data...")
+    _bl_flash_txn_imm(ser, ident[2],
+        write_data=[0x0B,  0x2, 0, 0,  0])
+    _bl_flash_txn(ser, 0, read_len=len(firmware), deassert_cs=True)
+    print("Verifying flash...")
+    calc_crc = _bl_crc(ser, 0, len(firmware))
+    if calc_crc != correct_crc:
+        raise Exception("verification failed!", calc_crc, correct_crc)
+
+
     print("Beginning execution...")
     _bl_jump_to_code(ser, 0, 0xFFF)
     print("Complete!")
