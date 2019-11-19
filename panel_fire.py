@@ -22,6 +22,10 @@ def firmware(bpp,
 
     fw = []
     r = RegisterManager()
+    fw.append([
+        MOVI(R7, 0x3FF8), # ensure W is set up correctly
+        STW(R7),
+    ])
     fw.append(L("main"))
 
     r += "R7:buf_ptr R6:buf_pos R5:curr_pix R4:total_pix R3:avg_pix"
