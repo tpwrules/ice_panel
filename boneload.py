@@ -102,7 +102,7 @@
 #   purpose: say that the command couldn't be processed for whatever reason.
 
 # result 3: CRC result
-#   length: 2
+#   length: 1
 #   parameter words: CRC of desired region
 #   purpose: give back the CRC
 
@@ -438,6 +438,8 @@ def _bfw_main(uart_addr, spi_addr):
         BEQ("sys_cmd_read_data"),
         CMPI(r.command, 4),
         BEQ("sys_cmd_jump_to_code"),
+        CMPI(r.command, 5),
+        BEQ("sys_cmd_crc"),
         CMPI(r.command, 6),
         BEQ("sys_cmd_flash_txn_imm"),
         CMPI(r.command, 7),
@@ -543,6 +545,27 @@ def _bfw_main(uart_addr, spi_addr):
         JR(R7, 0), # and jump to it
     ])
     r -= "dest_code dest_w result_code"
+    r += "R6:fp R5:crc_start R4:crc_end R3:crc_result"
+    fw.append([
+    L("sys_cmd_crc"),
+        # calculate CRC of some memory
+        CMPI(r.length, 2),
+        BNE("sys_packet_tx_invalid_length"),
+        LD(r.crc_start, r.buf_ptr, 0),
+        LD(r.crc_end, r.buf_ptr, 1),
+        JAL(r.lr, "calc_crc"),
+        LD(r.crc_result, r.fp, -8+0),
+        ST(r.crc_result, r.buf_ptr, 0),
+    ])
+    r -= "fp crc_start crc_end crc_result"
+    r += "R5:result_code"
+    fw.append([
+        MOVI(r.result_code, 0x0301), # result type 3 of length 1
+        # restore LR to main loop since we just used it above
+        MOVR(r.lr, "sys_packet_rx"),
+        J("tx_packet"),
+    ])
+    r -= "result_code"
     r += "R6:is_write R5:engine_cmd R4:txn_buf R3:txn_length"
     fw.append([
     L("sys_cmd_flash_txn_imm"),
@@ -726,6 +749,12 @@ def _bl_jump_to_code(ser, addr, w):
     if r != 1:
         raise Exception("huh? {} {}".format(r, p))
 
+def _bl_crc(ser, addr, crc_len):
+    r, p = _bl_command(ser, 5, [addr, crc_len])
+    if r != 3:
+        raise Exception("huh? {} {}".format(r, p))
+    return p[0]
+
 def _bl_flash_txn_imm(ser, max_length, *,
         write_data=None, read_len=None, deassert_cs=False):
     if write_data is not None and read_len is not None:
@@ -806,10 +835,10 @@ def boneload(firmware, port):
     print("Downloading program...")
     _bl_write_data(ser, 0, firmware, ident[2])
     print("Verifying program...")
-    got_firmware = _bl_read_data(ser, 0, len(firmware), ident[2])
-    for a, b in zip(firmware, got_firmware):
-        if a != b:
-            raise Exception("verification failed!")
+    correct_crc = _crc(firmware)
+    calc_crc = _bl_crc(ser, 0, len(firmware))
+    if calc_crc != correct_crc:
+        raise Exception("verification failed!", calc_crc, correct_crc)
 
     # it takes a couple microseconds to wake up, which parsing this comment
     # has already wasted
