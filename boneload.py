@@ -583,7 +583,7 @@ def _bfw_main(uart_addr, spi_addr):
         # do a flash transaction using data in RAM
         CMPI(r.length, 2),
         BNE("sys_packet_tx_invalid_length"),
-        LD(r.engine_cmd, r.buf_ptr, 1),
+        LD(r.engine_cmd, r.buf_ptr, 0),
         LD(r.txn_buf, r.buf_ptr, 1),
         JAL(r.lr, "flash_txn"),
         # restore LR to main loop since we just used it above
@@ -762,6 +762,19 @@ def _bl_flash_txn_imm(ser, max_length, *,
             read_data = read_data[:-1]
         return read_data
 
+def _bl_flash_txn(ser, addr, *,
+        write_len=None, read_len=None, deassert_cs=False):
+    if write_len is not None and read_len is not None:
+        raise ValueError("can only write or read, not both")
+    if write_len is None and read_len is None:
+        raise ValueError("must write or read, not neither")
+    if write_len is not None:
+        engine_cmd = (1<<15) + (int(deassert_cs)<<12) + write_len
+    else:
+        engine_cmd = (int(deassert_cs)<<12) + read_len
+    r, p = _bl_command(ser, 7, [engine_cmd, addr])
+
+
 # boneload the given firmware to the given port. firmware should be a list of
 # integers (each one is one word) and the port should be a string that can be
 # given to pyserial.
@@ -782,6 +795,14 @@ def boneload(firmware, port):
         raise Exception("incompatible version {}".format(ident[0]))
 
     print("Identified! Board ID=0x{:02X}, max length={}".format(*ident[1:]))
+    print("Awakening flash...")
+    _bl_flash_txn_imm(ser, ident[2], write_data=[0xAB], deassert_cs=True)
+    print("Writing command...")
+    _bl_write_data(ser, 343, [0x9F], ident[2])
+    print("Executing flash command...")
+    _bl_flash_txn(ser, 343, write_len=1)
+    _bl_flash_txn(ser, 343, read_len=3, deassert_cs=True)
+    print(_bl_read_data(ser, 343, 2, ident[2]))
     print("Downloading program...")
     _bl_write_data(ser, 0, firmware, ident[2])
     print("Verifying program...")
@@ -789,8 +810,7 @@ def boneload(firmware, port):
     for a, b in zip(firmware, got_firmware):
         if a != b:
             raise Exception("verification failed!")
-    print("Awakening flash...")
-    _bl_flash_txn_imm(ser, ident[2], write_data=[0xAB], deassert_cs=True)
+
     # it takes a couple microseconds to wake up, which parsing this comment
     # has already wasted
     print("Reading flash ID...")
@@ -804,4 +824,5 @@ def boneload(firmware, port):
     print("Complete!")
 
 if __name__ == "__main__":
-    print(len(boneload_fw()))
+    x = len(boneload_fw())
+    print("c:", x, "o:", x-256, "r:", 512-x)
