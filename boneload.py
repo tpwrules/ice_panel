@@ -407,6 +407,53 @@ def _bfw_flash_txn(spi_addr):
         JR(r.lr, 0),
     ]
 
+def _bfw_flash_boot():
+    # generate random prefix so that we effectively can make local labels
+    lp = "_{}_".format(random.randrange(2**32))
+    r = RegisterManager("R7:lr R5:engine_cmd R4:buf_addr "
+        "R2:zero R1:flash_addr")
+    return [
+        # wake the flash up
+        MOVI(r.engine_cmd, ((1<<15)|(1<<12))+1),
+        MOVR(r.buf_addr, lp+"wake_flash"),
+        JAL(r.lr, "flash_txn"),
+        # which takes some time
+        MOVI(r.zero, 255),
+    L(lp+"wake_wait"),
+        SUBI(r.zero, r.zero, 1),
+        BNZ(lp+"wake_wait"),
+        # now read in one SPRAM (16kwords) of flash
+        MOVI(r.flash_addr, 0),
+    L(lp+"load_loop"),
+        # store current flash page address to command buffer
+        STR(r.flash_addr, r.zero, lp+"read_page_2"),
+        MOVI(r.engine_cmd, (1<<15)+5),
+        MOVR(r.buf_addr, lp+"read_page"),
+        # go start that read process
+        JAL(r.lr, "flash_txn"),
+        # read the data into RAM (which is word-based)
+        MOVI(r.engine_cmd, (1<<12)+256),
+        SLLI(r.buf_addr, r.flash_addr, 7),
+        JAL(r.lr, "flash_txn"),
+        ADDI(r.flash_addr, r.flash_addr, 1),
+        CMPI(r.flash_addr, 128),
+        BNE(lp+"load_loop"),
+        # jump to the loaded code, which we assume starts at the start of RAM
+        JR(r.zero, 0),
+    
+    L(lp+"wake_flash"),
+        # we have to wake the flash up
+        0x00AB,
+    L(lp+"read_page"),
+        # then read one page of data.
+        0x020B, # command (lo) high byte of addr (hi)
+    L(lp+"read_page_2"),
+        0x0000, # mid byte of addr (lo) low byte of addr (hi)
+        # there is a dummy byte, but it doesn't matter what it is.
+        # so just let it read junk.
+    ]
+
+
 def _bfw_main(uart_addr, spi_addr):
     max_length = 16 # adjust to fill memory
     fw = []
@@ -414,11 +461,20 @@ def _bfw_main(uart_addr, spi_addr):
     r = RegisterManager("R7:lr R6:fp "
         "R5:result_code R4:command R1:buf_ptr R0:length")
     fw.append([
+        # receive the first packet here so we can start flash loading if it
+        # times out.
+        LDW(r.fp, 0),
+        JAL(r.lr, "rx_packet"),
+        LD(r.result_code, r.fp, -8+0),
+        CMPI(r.result_code, 3),
+        BEQ("flash_boot"),
+        J("spr_got"),
     L("sys_packet_rx"),
         LDW(r.fp, 0), # fetch window so we can get return values
         # receive a new packet from whatever's bootloading us
         JAL(r.lr, "rx_packet"),
         LD(r.result_code, r.fp, -8+0),
+    L("spr_got"),
         # load LR with the top of the rx loop so that subfunctions can just jump
         # to the tx packet routine and have it return correctly.
         MOVR(r.lr, "sys_packet_rx"),
@@ -618,7 +674,6 @@ def _bfw_main(uart_addr, spi_addr):
     ])
     r -= "engine_cmd"
     r += "R5:result_code"
-
     fw.append([ # declare subroutines
     L("calc_crc"),
         _bfw_calc_crc(),
@@ -628,6 +683,8 @@ def _bfw_main(uart_addr, spi_addr):
         _bfw_tx_packet(uart_addr),
     L("flash_txn"),
         _bfw_flash_txn(spi_addr),
+    L("flash_boot"),
+        _bfw_flash_boot(),
     ])
 
     # set up labels for packet buffer and reserve space so that we ensure we
