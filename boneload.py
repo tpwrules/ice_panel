@@ -426,9 +426,9 @@ def _bfw_flash_boot():
         MOVI(r.flash_addr, 0),
     L(lp+"load_loop"),
         # store current flash page address to command buffer
-        STR(r.flash_addr, r.zero, lp+"read_page_2"),
+        STR(r.flash_addr, r.zero, "fb_read_page_cmd_addr"),
         MOVI(r.engine_cmd, (1<<15)+5),
-        MOVR(r.buf_addr, lp+"read_page"),
+        MOVR(r.buf_addr, "fb_read_page_cmd_cmd"),
         # go start that read process
         JAL(r.lr, "flash_txn"),
         # read the data into RAM (which is word-based)
@@ -444,13 +444,6 @@ def _bfw_flash_boot():
     L(lp+"wake_flash"),
         # we have to wake the flash up
         0x00AB,
-    L(lp+"read_page"),
-        # then read one page of data.
-        0x020B, # command (lo) high byte of addr (hi)
-    L(lp+"read_page_2"),
-        0x0000, # mid byte of addr (lo) low byte of addr (hi)
-        # there is a dummy byte, but it doesn't matter what it is.
-        # so just let it read junk.
     ]
 
 
@@ -694,6 +687,17 @@ def _bfw_main(uart_addr, spi_addr, mini):
         _bfw_flash_txn(spi_addr),
     L("flash_boot"),
         _bfw_flash_boot(),
+    ])
+
+    fw.append([
+    L("fb_read_page_cmd_cmd"),
+        # command to read one page of data.
+        0x020B, # command (lo) high byte of addr (hi)
+    L("fb_read_page_cmd_addr"),
+        # there is one word of actual data but it gets set in the loop so it's
+        # fine if it overwrites the variables after. plus one more dummy byte
+        # which will be the value of some variable, but its value doesn't
+        # actually matter.
     ])
 
     # set up labels for packet buffer and reserve space so that we ensure we
