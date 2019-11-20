@@ -17,6 +17,7 @@ screen = pygame.display.set_mode((SCALE*DISP[0], 2*SCALE*DISP[1]+SCALE),
 # now enter pygame event loop
 frame_clock = pygame.time.Clock()
 frame = 0
+excepted = False
 while True:
     button_changed = False
     should_quit = True
@@ -40,10 +41,16 @@ while True:
             importlib.reload(disp_mod)
             # and start the whole deal over
             frame = 0
+            excepted = False
         except:
             traceback.print_exc()
 
-    disp_mod.draw(screen, frame)
+    if not excepted:
+        try:
+            disp_mod.draw(screen, frame)
+        except:
+            traceback.print_exc()
+            excepted = True
 
     pygame.display.flip()
     frame_clock.tick(30)
