@@ -14,7 +14,7 @@ def plasma3o(x, y, t):
     cy = y+.5*cos(t/3)
     return sin(sqrt(100*(cx*cx+cy*cy)+1)+t)
 
-funcso = [plasma1o]#, plasma2o, plasma3o]
+funcso = [plasma1o, plasma2o, plasma3o]
 
 def usin(x): return sin(x*tau)
 def ucos(x): return cos(x*tau)
@@ -30,37 +30,54 @@ def plasma1(x, y, t):
     return v&0xFFFF # f4.12
 
 # usin(v/2)/tau
-plasma2_table1 = [] # 1.12 -> f6.10
+plasma2_table1 = [] # 1.12 -> f4.12
 for n in range(8192):
     v = usin((n/4096)/2)/tau
-    plasma2_table1.append(int(v*1024))
+    plasma2_table1.append(int(v*4096))
 
 # ucos(v/3)/tau
-plasma2_table2 = [] # f1.12 -> f5.11
+plasma2_table2 = [] # f1.12 -> f4.12
 for n in range(8192):
     v = ucos((n/4096)/3)/tau
-    plasma2_table2.append(int(v*2048))
+    plasma2_table2.append(int(v*4096))
 
 def plasma2(x, y, t):
     c1 = 10 # f16.0
-    f1 = plasma2_table1[t & 0x1FFF] # f8.7
-    f2 = plasma2_table2[t & 0x1FFF] # f9.6
-    vf1 = (x*f1)>>3 # f11.5*f6.10 = f17.15 -> f4.12
-    vf2 = (y*f2)>>3 # f12.4*f5.11 = f17.15 -> f4.12
+    f1 = plasma2_table1[t & 0x1FFF] # f4.12
+    f2 = plasma2_table2[t & 0x1FFF] # f4.12
+    vf1 = (x*f1)>>5 # f11.5*f4.12 = f15.17 -> f4.12
+    vf2 = (y*f2)>>4 # f12.4*f4.12 = f16.16 -> f4.12
     v = c1*(vf1 + vf2) + t
     return v # f4.12
 
-def plasma3(x, y, t):
-    f1 = lambda v: .5*usin(v/5)
-    f2 = lambda v: .5*ucos(v/3)
-    f3 = lambda v: sqrt(100/(tau**2)*v+(1/(tau**2)))
-    f4 = lambda v: v*v
-    cx = x+f1(t)
-    cy = y+f2(t)
-    v = f3(f4(cx) + f4(cy)) + t
-    return int(v*1024)&0xFFFF # f6.10
+# .5*usin(v/5)/tau
+plasma3_table1 = [] # f1.12 -> f4.12
+for n in range(8192):
+    v = usin((n/4096)/5)/tau
+    plasma3_table1.append(int(v*4096))
 
-funcs = [plasma1]#, plasma2, plasma3]
+# sqrt(100*v+(1/(tau**2)))
+plasma3_table2 = [] # f0.15 -> f4.12
+for n in range(32768):
+    v = sqrt(100*(n/32768)+(1/(tau**2)))
+    plasma3_table2.append(int(v*4096))
+
+def plasma3(x, y, t):
+    global maxs, maxc
+    tau_ = int((1/tau)*4096) # f4.12
+    xf = plasma3_table1[t & 0x1FFF]>>1 # f4.12 divide by 2
+    yf = plasma2_table2[t & 0x1FFF]>>1 # f4.12 divide by 2
+    xs = (x*tau_)>>5 # f11.5*f4.12 = f15.17 = f4.12
+    ys = (y*tau_)>>4 # f12.4*f4.12 = f16.16 = f4.12
+    cx = abs(xs + xf) # f4.12
+    cy = abs(ys + yf) # f4.12
+    cx2 = (cx*cx)>>9 # f4.12*f4.12 = f8.24 -> f1.15
+    cy2 = (cy*cy)>>9 # f4.12*f4.12 = f8.24 -> f1.15
+    s = (cx2+cy2)&0x7FFF
+    v = plasma3_table2[s] + t
+    return v # f4.12
+
+funcs = [plasma1, plasma2, plasma3]#, plasma2, plasma3]
 
 output_table = [] # f0.8 -> f8.0
 for n in range(256):
@@ -71,7 +88,11 @@ for n in range(4096):
     v = usin(n/4096)
     table_usin_1.append(int(v*128)&0xFFFF)
 
+intt = 0
+ti = int((1/(30*tau))*4096)
+
 def draw(screen, frame):
+    global intt
     # original version
     t = frame/30
     for y_ in range(DISP[1]):
@@ -85,9 +106,12 @@ def draw(screen, frame):
                 (x_*SCALE, y_*SCALE, SCALE-4, SCALE-4))
 
     # modified, optimized version
-    t = frame/(30*tau)
+    intt += ti
+    t = intt & 0xFFFF
+    if t == 0:
+        print("wrapped")
     # convert t to f4.12. we need to figure out the period at some point...
-    t = int(t*4096)&0xFFFF
+    #t = int(t*4096)&0xFFFF
     for y_ in range(DISP[1]):
         y__ = y_-(DISP[1]//2)
         for x_ in range(DISP[0]):
@@ -106,4 +130,3 @@ def draw(screen, frame):
                 output_table[(v+170)&0xFF])
             screen.fill(output,
                 (x_*SCALE, (y_+DISP[1]+1)*SCALE, SCALE-4, SCALE-4))
-
