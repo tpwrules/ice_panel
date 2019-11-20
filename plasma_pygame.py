@@ -2,7 +2,6 @@ from math import sin, cos, pow, sqrt, pi, tau
 
 SCALE = 16
 DISP = (32, 16)
-
 ti = int((1/(30*tau))*4096)
 
 def plasma1o(x, y, t):
@@ -36,23 +35,23 @@ def plasma1(x, y, t, nt):
 
 # usin(v/2)/tau
 plasma2_table1 = [] # 1.12 -> f4.12
-for n in range(4096*2):
-    v = usin((n/4096)/2)/tau
+for n in range(512*2):
+    v = usin((n/512)/2)/tau
     plasma2_table1.append(int(v*4096))
 
 # ucos(v/3)/tau
 plasma2_table2 = [] # f2.12 -> f4.12
-for n in range(4096*3):
-    v = ucos((n/4096)/3)/tau
-    plasma2_table2.append(int(v*4096))
+for n in range(512*3):
+    v = ucos((n/512)/3)/tau
+    plasma2_table2.append(int(v*8192))
 
 p2t1 = 0
 p2t2 = 0
 def plasma2(x, y, t, nt):
     global p2t1, p2t2
     c1 = 10 # f16.0
-    f1 = plasma2_table1[p2t1] # f4.12
-    f2 = plasma2_table2[p2t2] # f4.12
+    f1 = plasma2_table1[p2t1>>3] # f4.12
+    f2 = plasma2_table2[p2t2>>3] # f3.13
     if nt:
         p2t1 += ti
         p2t2 += ti
@@ -61,29 +60,31 @@ def plasma2(x, y, t, nt):
         if p2t2 >= 3*4096:
             p2t2 -= 3*4096
     vf1 = (x*f1)>>5 # f11.5*f4.12 = f15.17 -> f4.12
-    vf2 = (y*f2)>>4 # f12.4*f4.12 = f16.16 -> f4.12
+    vf2 = (y*f2)>>5 # f12.4*f3.13 = f15.17 -> f4.12
     v = c1*(vf1 + vf2) + t
     return v # f4.12
 
 # .5*usin(v/5)/tau
 plasma3_table1 = [] # f3.12 -> f4.12
-for n in range(5*4096):
-    v = usin((n/4096)/5)/tau
+for n in range(5*512):
+    v = usin((n/512)/5)/tau
     plasma3_table1.append(int(v*4096))
 
 # sqrt(100*v+(1/(tau**2)))
 plasma3_table2 = [] # f0.15 -> f4.12
-for n in range(32768):
+for n in range(1632+1): # never goes past 1632
     v = sqrt(100*(n/32768)+(1/(tau**2)))
     plasma3_table2.append(int(v*4096))
 
 p3t1 = 0
 p3t2 = 0
+maxs = 0
 def plasma3(x, y, t, nt):
-    global p3t1, p3t2
-    tau_ = int((1/tau)*4096) # f4.12
-    xf = plasma3_table1[p3t1]>>1 # f4.12 divide by 2
-    yf = plasma2_table2[p3t2]>>1 # f4.12 divide by 2
+    global p3t1, p3t2, maxs
+    taux_ = int((1/tau)*4096) # f4.12
+    tauy_ = int((1/tau)*8192) # f3.13
+    xf = plasma3_table1[p3t1>>3]>>1 # f4.12 divide by 2
+    yf = plasma2_table2[p3t2>>3]>>2 # f3.13 -> f4.12 then divide by 2
     if nt:
         p3t1 += ti
         p3t2 += ti
@@ -91,13 +92,16 @@ def plasma3(x, y, t, nt):
             p3t1 -= 5*4096
         if p3t2 >= 3*4096:
             p3t2 -= 3*4096
-    xs = (x*tau_)>>5 # f11.5*f4.12 = f15.17 = f4.12
-    ys = (y*tau_)>>4 # f12.4*f4.12 = f16.16 = f4.12
-    cx = abs(xs + xf) # f4.12
-    cy = abs(ys + yf) # f4.12
+    xs = (x*taux_)>>5 # f11.5*f4.12 = f15.17 = f4.12
+    ys = (y*tauy_)>>5 # f12.4*f3.13 = f15.17 = f4.12
+    cx = xs + xf # f4.12
+    cy = ys + yf # f4.12
     cx2 = (cx*cx)>>9 # f4.12*f4.12 = f8.24 -> f1.15
     cy2 = (cy*cy)>>9 # f4.12*f4.12 = f8.24 -> f1.15
-    s = (cx2+cy2)&0x7FFF
+    s = (cx2+cy2)
+    if s > maxs:
+        print("max s =", s)
+        maxs = s
     v = plasma3_table2[s] + t
     return v # f4.12
 
@@ -107,9 +111,9 @@ output_table = [] # f0.8 -> f8.0
 for n in range(256):
     output_table.append(int((usin(n/256)+1)*255/2))
 
-table_usin_1 = [] # f0.12 -> f9.7
-for n in range(4096):
-    v = usin(n/4096)
+table_usin_1 = [] # f0.9 -> f9.7
+for n in range(1024):
+    v = usin(n/1024)
     table_usin_1.append(int(v*128)&0xFFFF)
 
 intt = 0
@@ -125,7 +129,7 @@ def draw(screen, frame):
     t = intt & 0xFFFF
 
     # original version
-    t /= (4096/tau)
+    t /= 4096/tau
     for y_ in range(DISP[1]):
         y__ = (y_-(DISP[1])/2)/DISP[1]
         for x_ in range(DISP[0]):
@@ -148,7 +152,7 @@ def draw(screen, frame):
                 fv = f(x_-(DISP[0]//2), y__, t, nt)&0xFFFF # f4.12
                 # all the functions need to be usined, using only the
                 # fractional part of the result.
-                v += table_usin_1[fv & 0xFFF]
+                v += table_usin_1[(fv>>2) & 0x3FF]
             nt = False
 
             # v is returned in f9.7 . since we need to divide v by 2,
