@@ -706,7 +706,7 @@ def _bfw_main(uart_addr, spi_addr, mini):
 
     return fw
 
-def boneload_fw(uart_addr=0, spi_addr=4, mini=False):
+def boneload_fw(uart_addr=0, spi_addr=16, mini=False):
     return Instr.assemble(_bfw_main(uart_addr, spi_addr, mini))
 
 # implementation taken from crcany

@@ -25,7 +25,7 @@ class BonelessLED(Elaboratable):
            gamma_params=self.gp)
 
         self.cpu_rom = Memory(width=16, depth=512,
-            init=boneload.boneload_fw(uart_addr=0, spi_addr=4))
+            init=boneload.boneload_fw(uart_addr=0, spi_addr=16))
         self.cpu_ram = SPRAM()
         self.cpu_core = CoreFSM(alsru_cls=ALSRU_4LUT,
             reset_pc=0xFE00, reset_w=0xFFF8)
@@ -84,23 +84,22 @@ class BonelessLED(Elaboratable):
             m.d.comb += cpu_core.i_mem_data.eq(cpu_ram.o_data)
 
 
-        # split up the external bus
-        uart_en = Signal()
-        spi_en = Signal()
+        # split up the external bus into 8 regions of 16 registers. this way,
+        # all of them can be addressed absolutely. of course, the panel
+        # framebuffer is special and gets the entire top half of the address
+        # space to itself.
+        periph_en = Signal(8)
         panel_en = Signal()
-        addr = cpu_core.o_bus_addr
-        m.d.comb += [
-            uart_en.eq((addr[-1] == 0) & (addr[2] == 0)),
-            spi_en.eq((addr[-1] == 0) & (addr[2] == 1)),
-            panel_en.eq(cpu_core.o_bus_addr[-1] == 1),
-        ]
-        # remember what was active so we can redirect reads appropriately
-        uart_was_en = Signal()
-        spi_was_en = Signal()
-        m.d.sync += [
-            uart_was_en.eq(uart_en),
-            spi_was_en.eq(spi_en),
-        ]
+        ext_addr = cpu_core.o_bus_addr
+        for x in range(8):
+            m.d.comb += periph_en[x].eq(
+                (ext_addr[-1] == 0) & (ext_addr[4:7] == x))
+        m.d.comb += panel_en.eq(ext_addr[-1] == 1)
+
+        periph_was_en = Signal(8)
+        # remember what was active so we can redirect reads appropriately. the
+        # framebuffer can't be read from so we ignore it here.
+        m.d.sync += periph_was_en.eq(periph_en)
 
         # hook up the CPU's external bus to the panel engine
         m.d.sync += [
@@ -109,38 +108,39 @@ class BonelessLED(Elaboratable):
             panel.i_wdata.eq(cpu_core.o_ext_data[:self.gp.bpp])
         ]
 
-        # then to the UART
+        # plus the UART as peripheral 0
+        uart_en = periph_en[0]
+        uart_was_en = periph_was_en[0]
         m.d.comb += [
+            # peripheral to bus
             uart.i_re.eq(cpu_core.o_ext_re & uart_en),
             uart.i_we.eq(cpu_core.o_ext_we & uart_en),
-            uart.i_addr.eq(cpu_core.o_bus_addr[:2]),
+            uart.i_addr.eq(ext_addr[:2]),
             uart.i_wdata.eq(cpu_core.o_ext_data),
-        ]
-        m.d.comb += [
+            # peripheral to outside world
             uart.i_rx.eq(uart_pins.rx),
             uart_pins.tx.eq(uart.o_tx),
         ]
+        with m.If(uart_was_en):
+            m.d.comb += cpu_core.i_ext_data.eq(uart.o_rdata)
 
-        # and the SPI
+        # plus the SPI flash as peripheral 1
+        spi_en = periph_en[1]
+        spi_was_en = periph_was_en[1]
         m.d.comb += [
+            # peripheral to bus
             spi.i_re.eq(cpu_core.o_ext_re & spi_en),
             spi.i_we.eq(cpu_core.o_ext_we & spi_en),
-            spi.i_addr.eq(cpu_core.o_bus_addr[:1]),
+            spi.i_addr.eq(ext_addr[:1]),
             spi.i_wdata.eq(cpu_core.o_ext_data),
-        ]
-        m.d.comb += [
+            # peripheral to outside world
             spi_pins.clk.eq(spi.o_clk),
             spi_pins.cs.eq(~spi.o_cs),
             spi_pins.mosi.eq(spi.o_mosi),
             spi.i_miso.eq(spi_pins.miso),
         ]
-
-        with m.If(uart_was_en):
-            m.d.comb += cpu_core.i_ext_data.eq(uart.o_rdata)
-        with m.Elif(spi_was_en):
+        with m.If(spi_was_en):
             m.d.comb += cpu_core.i_ext_data.eq(spi.o_rdata)
-
-        
 
         return m
 
