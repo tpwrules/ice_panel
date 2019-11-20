@@ -14,6 +14,7 @@ from pll import PLL
 from spram import SPRAM
 import uart
 import spi
+import multiplier
 
 
 class BonelessLED(Elaboratable):
@@ -33,6 +34,7 @@ class BonelessLED(Elaboratable):
         self.uart = uart.SimpleUART(
             default_divisor=uart.calculate_divisor(12e6, 115200))
         self.spi = spi.SimpleSPI(fifo_depth=512)
+        self.mul = multiplier.Multiplier(signed=True)
 
     def elaborate(self, platform):
         uart_pins = platform.request("uart")
@@ -47,6 +49,7 @@ class BonelessLED(Elaboratable):
         m.submodules.cpu_ram = cpu_ram = self.cpu_ram
         m.submodules.uart = uart = self.uart
         m.submodules.spi = spi = self.spi
+        m.submodules.mul = mul = self.mul
 
         # split up main bus
         rom_en = Signal()
@@ -91,10 +94,12 @@ class BonelessLED(Elaboratable):
         periph_en = Signal(8)
         panel_en = Signal()
         ext_addr = cpu_core.o_bus_addr
+        ext_old_addr = Signal(16)
         for x in range(8):
             m.d.comb += periph_en[x].eq(
                 (ext_addr[-1] == 0) & (ext_addr[4:7] == x))
         m.d.comb += panel_en.eq(ext_addr[-1] == 1)
+        m.d.sync += ext_old_addr.eq(ext_addr)
 
         periph_was_en = Signal(8)
         # remember what was active so we can redirect reads appropriately. the
@@ -141,6 +146,28 @@ class BonelessLED(Elaboratable):
         ]
         with m.If(spi_was_en):
             m.d.comb += cpu_core.i_ext_data.eq(spi.o_rdata)
+
+        # plus the multiplier as peripheral 2
+        mul_en = periph_en[2]
+        mul_was_en = periph_was_en[2]
+        m.d.comb += [
+            # connect bus to both multipler inputs
+            mul.i_a.eq(cpu_core.o_ext_data),
+            mul.i_b.eq(cpu_core.o_ext_data),
+            # load the input corresponding to the address
+            mul.i_a_we.eq(mul_en & cpu_core.o_ext_we & (ext_addr[0] == 0)),
+            mul.i_b_we.eq(mul_en & cpu_core.o_ext_we & (ext_addr[1] == 0)),
+        ]
+        # register output. no idea about the latency. but we have minimum four
+        # cycles between a read and a write to a peripheral.
+        mul_out = Signal(16)
+        m.d.sync += mul_out.eq(mul.o_result)
+        # allow the user to get the result at any shift amount
+        with m.If(mul_was_en):
+            with m.Switch(ext_old_addr[:4]):
+                for x in range(16):
+                    with m.Case(x):
+                        m.d.comb += cpu_core.i_ext_data.eq(mul_out>>x)
 
         return m
 
