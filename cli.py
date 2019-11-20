@@ -38,6 +38,8 @@ def main_parser(parser=None):
         "boneload", help="boneload design firmware into device")
     p_boneload.add_argument("-p", "--port", type=str, required=True,
         help="serial port to program over")
+    p_boneload.add_argument("-r", "--ram", action="store_true",
+        help="download to ram only")
 
     return parser
 
@@ -59,7 +61,7 @@ def main_runner(parser, args, maker, fw=None, ports=(), build_args={}):
 
     if args.action == "boneload":
         import boneload
-        boneload.boneload(fw(), args.port)
+        boneload.boneload(fw(), args.port, args.ram)
 
 def main(*args, **kwargs):
     parser = main_parser()

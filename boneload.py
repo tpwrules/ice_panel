@@ -871,7 +871,7 @@ def _bl_flash_txn(ser, addr, *,
 # boneload the given firmware to the given port. firmware should be a list of
 # integers (each one is one word) and the port should be a string that can be
 # given to pyserial.
-def boneload(firmware, port):
+def boneload(firmware, port, ram_only=False):
     import serial
     firmware = Instr.assemble(firmware)
     print("Connecting...")
@@ -895,6 +895,12 @@ def boneload(firmware, port):
     calc_crc = _bl_crc(ser, 0, len(firmware))
     if calc_crc != correct_crc:
         raise Exception("verification failed!", calc_crc, correct_crc)
+
+    if ram_only:
+        print("Beginning execution...")
+        _bl_jump_to_code(ser, 0, 0xFFF)
+        print("Complete!")
+        return
 
     print("Awakening flash...")
     _bl_flash_txn_imm(ser, ident[2], write_data=[0xAB], deassert_cs=True)
@@ -956,7 +962,6 @@ def boneload(firmware, port):
     calc_crc = _bl_crc(ser, 0, len(firmware))
     if calc_crc != correct_crc:
         raise Exception("verification failed!", calc_crc, correct_crc)
-
 
     print("Beginning execution...")
     _bl_jump_to_code(ser, 0, 0xFFF)
