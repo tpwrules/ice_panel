@@ -32,10 +32,10 @@ hub75_pmod = [
             Attrs(IO_STANDARD="SB_LVCMOS33")),
         Subsignal("a2", Pins("3", dir="o", conn=("pmod", 1)),
             Attrs(IO_STANDARD="SB_LVCMOS33")),
-        Subsignal("a3", Pins("4", dir="o", conn=("pmod", 1)),
-            Attrs(IO_STANDARD="SB_LVCMOS33")),
-        Subsignal("a4", Pins("10", dir="o", conn=("pmod", 1)),
-            Attrs(IO_STANDARD="SB_LVCMOS33")),
+        # Subsignal("a3", Pins("4", dir="o", conn=("pmod", 1)),
+        #     Attrs(IO_STANDARD="SB_LVCMOS33")),
+        # Subsignal("a4", Pins("10", dir="o", conn=("pmod", 1)),
+        #     Attrs(IO_STANDARD="SB_LVCMOS33")),
 
         # color shift clock
         Subsignal("shift_clock", Pins("9", dir="o", conn=("pmod", 1)),
@@ -46,5 +46,8 @@ hub75_pmod = [
         # blank the display (turn off all LEDs)
         Subsignal("blank", Pins("7", dir="o", conn=("pmod", 1)),
             Attrs(IO_STANDARD="SB_LVCMOS33")),
-    )
+    ),
+    # the button on the front panel of the purse
+    Resource("front_button", 0, PinsN("4", dir="i", conn=("pmod", 1)),
+        Attrs(IO_STANDARD="SB_LVCMOS", PULLUP=1)),
 ]

@@ -724,7 +724,7 @@ class HUB75Driver(Elaboratable):
 
             # jam together the row selection pins that go to the display
             # and update them with the current row selection.
-            Cat(getattr(hub75, "a"+str(n)) for n in range(5)).eq(
+            Cat(getattr(hub75, "a"+str(n)) for n in range(3)).eq(
                 Cat(ftg.o_row_sel, 0))
         ]
 

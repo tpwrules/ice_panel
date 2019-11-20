@@ -35,8 +35,6 @@ class BonelessLED(Elaboratable):
         self.spi = spi.SimpleSPI(fifo_depth=512)
 
     def elaborate(self, platform):
-        platform.add_resources(pmod_resources.hub75_pmod)
-
         uart_pins = platform.request("uart")
         spi_pins = platform.request("spi_flash_1x")
 
@@ -327,8 +325,12 @@ class Top(Elaboratable):
         self.led_freq_mhz = led_freq_mhz
 
     def elaborate(self, platform):
+        platform.add_resources(pmod_resources.hub75_pmod)
+
         m = Module()
         reset_btn = platform.request("button", 0) # should be the user button
+        # the button on the front of the purse
+        reset_btn_2 = platform.request("front_button", 0)
         if self.led_freq_mhz != 12:
             # we need a PLL so we can boost the clock. reserve the clock pin
             # before it gets switched to the default domain.
@@ -339,7 +341,7 @@ class Top(Elaboratable):
                 pll_domain_name="led", # runs at the LED frequency
             )
             m.submodules.pll = pll
-            m.d.comb += pll.reset.eq(~reset_btn)
+            m.d.comb += pll.reset.eq(~reset_btn & ~reset_btn_2)
             led_domain = "led"
         else:
             # the user doesn't want to run faster and the PLL can't make
