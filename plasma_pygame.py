@@ -24,35 +24,42 @@ def ucos(x): return cos(x*tau)
 # cn = constant that can be simplified
 # fn = function that can be converted into a table
 
-def plasma1(x, y, t, nt):
-    # x = f11.5
+plasma1_table1 = [0]*32 # 0.5 -> 4.12
+for x in range(-16, 16):
     c1 = int(10/tau * 4096)&0xFFFF # f4.12
     v = x*c1 # f15.17, must be SIGNED!!!!
-    v = ((v>>5)&0xFFFF) + t
-    return v&0xFFFF # f4.12
+    plasma1_table1[x&0x1F] = (v>>5)&0xFFFF
+
+def plasma1(x, y, t, nt):
+    # x = f11.5
+    return plasma1_table1[x&0x1F]+t # f4.12
 
 # usin(v/2)/tau
 plasma2_table1 = [] # 1.12 -> f4.12
-for n in range(8192):
+for n in range(4096*2):
     v = usin((n/4096)/2)/tau
     plasma2_table1.append(int(v*4096))
 
 # ucos(v/3)/tau
-plasma2_table2 = [] # f1.12 -> f4.12
+plasma2_table2 = [] # f2.12 -> f4.12
 for n in range(4096*3):
     v = ucos((n/4096)/3)/tau
     plasma2_table2.append(int(v*4096))
 
-p2t = 0
+p2t1 = 0
+p2t2 = 0
 def plasma2(x, y, t, nt):
-    global p2t
+    global p2t1, p2t2
     c1 = 10 # f16.0
-    f1 = plasma2_table1[t & 0x1FFF] # f4.12
-    f2 = plasma2_table2[p2t] # f4.12
+    f1 = plasma2_table1[p2t1] # f4.12
+    f2 = plasma2_table2[p2t2] # f4.12
     if nt:
-        p2t += ti
-        if p2t >= 3*4096:
-            p2t -= 3*4096
+        p2t1 += ti
+        p2t2 += ti
+        if p2t1 >= 2*4096:
+            p2t1 -= 2*4096
+        if p2t2 >= 3*4096:
+            p2t2 -= 3*4096
     vf1 = (x*f1)>>5 # f11.5*f4.12 = f15.17 -> f4.12
     vf2 = (y*f2)>>4 # f12.4*f4.12 = f16.16 -> f4.12
     v = c1*(vf1 + vf2) + t
@@ -94,7 +101,7 @@ def plasma3(x, y, t, nt):
     v = plasma3_table2[s] + t
     return v # f4.12
 
-funcs = [plasma1, plasma2, plasma3]#, plasma3]#, plasma2, plasma3]
+funcs = [plasma1, plasma2, plasma3]
 
 output_table = [] # f0.8 -> f8.0
 for n in range(256):
@@ -115,8 +122,10 @@ def draw(screen, frame):
         p3t1 = 0
         p3t2 = 0
 
+    t = intt & 0xFFFF
+
     # original version
-    t = frame/30
+    t /= (4096/tau)
     for y_ in range(DISP[1]):
         y__ = (y_-(DISP[1])/2)/DISP[1]
         for x_ in range(DISP[0]):
@@ -130,8 +139,6 @@ def draw(screen, frame):
     # modified, optimized version
     t = intt & 0xFFFF
     intt += ti
-    # convert t to f4.12. we need to figure out the period at some point...
-    #t = int(t*4096)&0xFFFF
     nt = True
     for y_ in range(DISP[1]):
         y__ = y_-(DISP[1]//2)
