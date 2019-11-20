@@ -24,28 +24,37 @@ def ucos(x): return cos(x*tau)
 
 def plasma1(x, y, t):
     c1 = 10/tau
-    f1 = lambda v: usin(v)
-    return f1(x*c1 + t)
+    v = x*c1 + t
+    return int(v*1024)&0xFFFF # f6.10
 
 def plasma2(x, y, t):
     c1 = 10
     # / tau could be moved to c1 as well, depending on precision
     f1 = lambda v: usin(v/2)/tau
     f2 = lambda v: ucos(v/3)/tau
-    f3 = lambda v: usin(v)
-    return f3(c1*( x*f1(t) + y*f2(t) ) + t)
+    v = c1*( x*f1(t) + y*f2(t) ) + t
+    return int(v*1024)&0xFFFF # f6.10
 
 def plasma3(x, y, t):
     f1 = lambda v: .5*usin(v/5)
     f2 = lambda v: .5*ucos(v/3)
     f3 = lambda v: sqrt(100/(tau**2)*v+(1/(tau**2)))
     f4 = lambda v: v*v
-    f5 = lambda v: usin(v)
     cx = x+f1(t)
     cy = y+f2(t)
-    return f5(f3(f4(cx) + f4(cy)) + t)
+    v = f3(f4(cx) + f4(cy)) + t
+    return int(v*1024)&0xFFFF # f6.10
 
 funcs = [plasma1, plasma2, plasma3]
+
+output_table = [] # f0.8 -> f8.0
+for n in range(256):
+    output_table.append(int((usin(n/256)+1)*255/2))
+
+table_usin_1 = [] # f0.10 -> f9.7
+for n in range(1024):
+    v = usin(n/1024)
+    table_usin_1.append(int(v*128)&0xFFFF)
 
 def draw(screen, frame):
     # original version
@@ -65,10 +74,19 @@ def draw(screen, frame):
     for y_ in range(DISP[1]):
         y__ = ((y_-(DISP[1])/2)/DISP[1])
         for x_ in range(DISP[0]):
-            v = sum([f(((x_-(DISP[0]/2))/DISP[0]), y__, t) for f in funcs])
-            output = (int((usin(v*0.5)+1)*255/2),
-                int((usin(v*0.5+0.333333)+1)*255/2),
-                int((usin(v*0.5+0.666667)+1)*255/2))
+            v = 0
+            for f in funcs:
+                fv = f(((x_-(DISP[0]/2))/DISP[0]), y__, t) # f6.10
+                # all the functions need to be usined, using only the
+                # fractional part of the result.
+                v += table_usin_1[fv & 0x3FF]
+
+            # v is returned in f9.7 . since we need to divide v by 2,
+            # we just interpret it as f8.8 and the division is done.
+            v = v&0xFF # remove integer bits
+            output = (output_table[v], # and look up result in table
+                output_table[(v+85)&0xFF],
+                output_table[(v+170)&0xFF])
             screen.fill(output,
                 (x_*SCALE, (y_+DISP[1]+1)*SCALE, SCALE-4, SCALE-4))
 
