@@ -34,7 +34,7 @@ class BonelessLED(Elaboratable):
         self.uart = uart.SimpleUART(
             default_divisor=uart.calculate_divisor(12e6, 115200))
         self.spi = spi.SimpleSPI(fifo_depth=512)
-        self.mul = multiplier.Multiplier(signed=True)
+        self.mul = multiplier.Multiplier(signed=False)
 
     def elaborate(self, platform):
         uart_pins = platform.request("uart")
@@ -156,11 +156,11 @@ class BonelessLED(Elaboratable):
             mul.i_b.eq(cpu_core.o_ext_data),
             # load the input corresponding to the address
             mul.i_a_we.eq(mul_en & cpu_core.o_ext_we & (ext_addr[0] == 0)),
-            mul.i_b_we.eq(mul_en & cpu_core.o_ext_we & (ext_addr[1] == 0)),
+            mul.i_b_we.eq(mul_en & cpu_core.o_ext_we & (ext_addr[0] == 1)),
         ]
         # register output. no idea about the latency. but we have minimum four
         # cycles between a read and a write to a peripheral.
-        mul_out = Signal(16)
+        mul_out = Signal(32)
         m.d.sync += mul_out.eq(mul.o_result)
         # allow the user to get the result at any shift amount
         with m.If(mul_was_en):

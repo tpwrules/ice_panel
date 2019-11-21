@@ -20,6 +20,11 @@ def firmware():
     # how much time passes every frame, in f0.12 format.
     t_inc = int((1/(30*tau))*4096)
 
+    # addresses of the multiplier peripheral
+    mulp_in_a = 32
+    mulp_in_b = 33
+    mulp_res = range(32, 48)
+
     fw = []
     r = RegisterManager()
     fw.append([
@@ -51,15 +56,15 @@ def firmware():
     L("x_loop"),
         # there are three sub-effects, and we sum the result to calculate the
         # index of this pixel.
-        JAL(r.lr, "sub_effect_1"),
-        LD(r.fx_total, r.fp, -8+0),
-        ADD(r.fx_total, r.fx_total, r.curr_t),
-        # JAL(r.lr, "sub_effect_2"),
-        # LDR(r.fx_curr, r.fp, -8+0),
-        # ADD(r.fx_total, r.fx_total, r.fx_curr),
+        # JAL(r.lr, "sub_effect_1"),
+        # LD(r.fx_total, r.fp, -8+0),
         # ADD(r.fx_total, r.fx_total, r.curr_t),
+        JAL(r.lr, "sub_effect_2"),
+        LD(r.fx_total, r.fp, -8+0),
+        #ADD(r.fx_total, r.fx_total, r.fx_curr),
+        ADD(r.fx_total, r.fx_total, r.curr_t),
         # JAL(r.lr, "sub_effect_3"),
-        # LDR(r.fx_curr, r.fp, -8+0),
+        # LD(r.fx_curr, r.fp, -8+0),
         # ADD(r.fx_total, r.fx_total, r.fx_curr),
         # ADD(r.fx_total, r.fx_total, r.curr_t),
         
@@ -114,25 +119,29 @@ def firmware():
         # bits, necessarily.
         MOVR(r.ct_ptr, "cyc_t"),
         LD(r.ct_curr, r.ct_ptr, 0),
+        ADDI(r.ct_curr, r.ct_curr, t_inc),
         MOVI(r.ct_max, 2*4096),
         CMP(r.ct_curr, r.ct_max),
         BLTU("cyc_t_not_0"),
         SUB(r.ct_curr, r.ct_curr, r.ct_max),
-        ST(r.ct_curr, r.ct_ptr, 0),
     L("cyc_t_not_0"),
+        ST(r.ct_curr, r.ct_ptr, 0),
         LD(r.ct_curr, r.ct_ptr, 1),
+        ADDI(r.ct_curr, r.ct_curr, t_inc),
         MOVI(r.ct_max, 3*4096),
         CMP(r.ct_curr, r.ct_max),
         BLTU("cyc_t_not_1"),
         SUB(r.ct_curr, r.ct_curr, r.ct_max),
-        ST(r.ct_curr, r.ct_ptr, 1),
     L("cyc_t_not_1"),
-        LD(r.ct_curr, r.ct_ptr, 3),
+        ST(r.ct_curr, r.ct_ptr, 1),
+        LD(r.ct_curr, r.ct_ptr, 2),
+        ADDI(r.ct_curr, r.ct_curr, t_inc),
         MOVI(r.ct_max, 5*4096),
         CMP(r.ct_curr, r.ct_max),
-        BLTU("main_loop"),
+        BLTU("cyc_t_not_2"),
         SUB(r.ct_curr, r.ct_curr, r.ct_max),
-        ST(r.ct_curr, r.ct_ptr, 3),
+    L("cyc_t_not_2"),
+        ST(r.ct_curr, r.ct_ptr, 2),
         J("main_loop"),
 
     ])
@@ -142,10 +151,46 @@ def firmware():
     L("sub_effect_1"),
         # refreshingly simple! just a table lookup
         LDW(r.fp, -8),
-
         LD(r.curr_x, r.fp, 5),
+
         ANDI(r.curr_x, r.curr_x, 0x1F),
         LDR(r.result, r.curr_x, "tbl_fx_1_1"),
+
+        ADJW(8),
+        JR(R7, 0),
+    ])
+    r -= "!"
+    r += "R6:fp R5:curr_x R4:curr_y R3:res_x R2:res_y R1:temp R0:result"
+    fw.append([
+    L("sub_effect_2"),
+        # not so simple
+        LDW(r.fp, -8),
+        LD(r.curr_x, r.fp, 5),
+        LD(r.curr_y, r.fp, 4),
+
+        # look up the table entries based on the timer values
+        MOVR(r.temp, "cyc_t"),
+        LD(r.res_x, r.temp, 0),
+        SRLI(r.res_x, r.res_x, 3),
+        LDR(r.res_x, r.res_x, "tbl_fx_2_1"),
+        LD(r.res_y, r.temp, 1),
+        SRLI(r.res_y, r.res_y, 3),
+        LDR(r.res_y, r.res_y, "tbl_fx_2_2"),
+
+        # multiply the result by the coordinate
+        STXA(r.curr_x, mulp_in_a),
+        STXA(r.res_x, mulp_in_b),
+        LDXA(r.res_x, mulp_res[5]), # >> 5 to make points line up
+        STXA(r.curr_y, mulp_in_a),
+        STXA(r.res_y, mulp_in_b),
+        LDXA(r.res_y, mulp_res[5]), # >> 5 to make points line up
+
+        # sum coordinate results and multiply by 10 to get final answer
+        MOVI(r.result, 10),
+        STXA(r.result, mulp_in_a),
+        ADD(r.result, r.res_x, r.res_y),
+        STXA(r.result, mulp_in_b),
+        LDXA(r.result, mulp_res[0]),
 
         ADJW(8),
         JR(R7, 0),
@@ -159,6 +204,19 @@ def firmware():
         v = ((x*c1)>>5)&0xFFFF # f0.5*f4.12 = f15.17 -> f4.12
         tbl_fx_1_1[x&0x1F] = v
     fw.append([L("tbl_fx_1_1"), tbl_fx_1_1])
+
+    # sub effect 2 tables
+    tbl_fx_2_1 = [] # fX.9 -> f4.12
+    for n in range(512*2): # enough to go through whole sine period
+        v = usin((n/512)/2)/tau
+        tbl_fx_2_1.append(int(v*4096)&0xFFFF)
+    fw.append([L("tbl_fx_2_1"), tbl_fx_2_1])
+
+    tbl_fx_2_2 = [] # fX.9 -> f3.13
+    for n in range(512*3): # enough to go through whole cosine period
+        v = ucos((n/512)/3)/tau
+        tbl_fx_2_2.append(int(v*8192)&0xFFFF)
+    fw.append([L("tbl_fx_2_2"), tbl_fx_2_2])
 
     # output tables.
     # sine of the total for this pixel

@@ -25,19 +25,18 @@ def firmware():
         JAL(r.lr, "uart_tx"),
 
         # multiply 3 by 2
-        MOVI(r.num1, 3),
-        MOVI(r.num2, 2),
+        MOVI(r.num1, 65521),
+        MOVI(r.num2, 7),
         STXA(r.num1, 32),
         STXA(r.num2, 33),
-        LDXA(r.result, 32),
+        LDXA(r.result, 32+5), # result should be 0x37FC
 
         # and then transmit it
-        MOV(r.data, r.result),
+        ANDI(r.data, r.result, 0xFF),
+        JAL(r.lr, "uart_tx"),
+        SRLI(r.data, r.result, 8),
         JAL(r.lr, "uart_tx"),
 
-        LDXA(r.result, 33),
-        MOV(r.data, r.result),
-        JAL(r.lr, "uart_tx"),
 
         # and do it all again
         J("main"),
