@@ -1,4 +1,6 @@
-# extremely cool plasma effect, from my personal collection™
+# extremely cool plasma effect, from my personal collection™.
+# please see "panel_plasma.py" for the original math and an explanation of the
+# fixed point math.
 
 from math import sin, cos, sqrt, tau, pi
 
@@ -54,25 +56,34 @@ def firmware():
     L("y_loop"),
         MOVI(r.curr_x, -16),
     L("x_loop"),
-        # there are three sub-effects, and we sum the result to calculate the
-        # index of this pixel.
-        # JAL(r.lr, "sub_effect_1"),
-        # LD(r.fx_total, r.fp, -8+0),
-        # ADD(r.fx_total, r.fx_total, r.curr_t),
-        JAL(r.lr, "sub_effect_2"),
+        # there are three sub-effects, and we sum the sine of each result (plus
+        # time) to calculate the index of this pixel.
+        JAL(r.lr, "sub_effect_1"),
         LD(r.fx_total, r.fp, -8+0),
-        #ADD(r.fx_total, r.fx_total, r.fx_curr),
         ADD(r.fx_total, r.fx_total, r.curr_t),
-        # JAL(r.lr, "sub_effect_3"),
-        # LD(r.fx_curr, r.fp, -8+0),
-        # ADD(r.fx_total, r.fx_total, r.fx_curr),
-        # ADD(r.fx_total, r.fx_total, r.curr_t),
-        
         SRLI(r.fx_total, r.fx_total, 2),
         ANDI(r.fx_total, r.fx_total, 0x3FF),
         LDR(r.fx_total, r.fx_total, "tbl_output_sine"),
 
+        JAL(r.lr, "sub_effect_2"),
+        LD(r.fx_curr, r.fp, -8+0),
+        ADD(r.fx_curr, r.fx_curr, r.curr_t),
+        SRLI(r.fx_curr, r.fx_curr, 2),
+        ANDI(r.fx_curr, r.fx_curr, 0x3FF),
+        LDR(r.fx_curr, r.fx_curr, "tbl_output_sine"),
+        ADD(r.fx_total, r.fx_total, r.fx_curr),
+
+        JAL(r.lr, "sub_effect_3"),
+        LD(r.fx_curr, r.fp, -8+0),
+        ADD(r.fx_curr, r.fx_curr, r.curr_t),
+        SRLI(r.fx_curr, r.fx_curr, 2),
+        ANDI(r.fx_curr, r.fx_curr, 0x3FF),
+        LDR(r.fx_curr, r.fx_curr, "tbl_output_sine"),
+        ADD(r.fx_total, r.fx_total, r.fx_curr),
+
+
         # convert index to R, G, and B
+        ANDI(r.fx_total, r.fx_total, 0xFF),
         LDR(r.fx_curr, r.fx_total, "tbl_output_colormap"),
         ST(r.fx_curr, r.scr_ptr, 0),
         ADDI(r.fx_total, r.fx_total, 85),
@@ -196,6 +207,55 @@ def firmware():
         JR(R7, 0),
     ])
     r -= "!"
+    div_tau_x = int((1/tau)*4096) # f4.12
+    div_tau_y = int((1/tau)*8192) # f3.13
+    r += "R6:fp R5:curr_x R4:curr_y R3:res_x R2:res_y R1:temp R0:result"
+    fw.append([
+    L("sub_effect_3"),
+        # not at all simple
+        LDW(r.fp, -8),
+        LD(r.curr_x, r.fp, 5),
+        LD(r.curr_y, r.fp, 4),
+
+        # look up the table entries based on the timer values
+        MOVR(r.temp, "cyc_t"),
+        LD(r.res_x, r.temp, 2),
+        SRLI(r.res_x, r.res_x, 3),
+        LDR(r.res_x, r.res_x, "tbl_fx_3_1"),
+        LD(r.res_y, r.temp, 1),
+        SRLI(r.res_y, r.res_y, 3),
+        LDR(r.res_y, r.res_y, "tbl_fx_2_2"),
+        SRAI(r.res_y, r.res_y, 2),
+
+        # divide the coordinates by tau
+        MOVI(r.temp, div_tau_x),
+        STXA(r.curr_x, mulp_in_a),
+        STXA(r.temp, mulp_in_b),
+        LDXA(r.curr_x, mulp_res[5]), # >> 5 to make points line up
+        MOVI(r.temp, div_tau_y),
+        STXA(r.curr_y, mulp_in_a),
+        STXA(r.temp, mulp_in_b),
+        LDXA(r.curr_y, mulp_res[5]), # >> 5 to make points line up
+
+        # add table values to components and square them. note that we take the
+        # absolute value because the multiplication is unsigned.
+        ADD(r.res_x, r.res_x, r.curr_x),
+        STXA(r.res_x, mulp_in_a),
+        STXA(r.res_x, mulp_in_b),
+        LDXA(r.res_x, mulp_res[9]), # >> 9 to make the components line up
+        ADD(r.res_y, r.res_y, r.curr_y),
+        STXA(r.res_y, mulp_in_a),
+        STXA(r.res_y, mulp_in_b),
+        LDXA(r.res_y, mulp_res[9]), # >> 9 to make the components line up
+
+        # sum final result and look up in square root table
+        ADD(r.result, r.res_x, r.res_y),
+        LDR(r.result, r.result, "tbl_fx_3_2"),
+
+        ADJW(8),
+        JR(R7, 0),
+    ])
+    r -= "!"
 
     # sub effect 1 tables
     tbl_fx_1_1 = [0]*32 # f0.5 -> f4.12
@@ -217,6 +277,19 @@ def firmware():
         v = ucos((n/512)/3)/tau
         tbl_fx_2_2.append(int(v*8192)&0xFFFF)
     fw.append([L("tbl_fx_2_2"), tbl_fx_2_2])
+
+    # sub effect 3 tables
+    tbl_fx_3_1 = [] # fX.9 -> f4.12
+    for n in range(5*512): # enough to go through whole sine period
+        v = .5*usin((n/512)/5)/tau
+        tbl_fx_3_1.append(int(v*4096)&0xFFFF)
+    fw.append([L("tbl_fx_3_1"), tbl_fx_3_1])
+
+    tbl_fx_3_2 = [] # f0.15 -> f4.12
+    for n in range(1632+1): # empirically never goes past 1632
+        v = sqrt(100*(n/32768)+(1/(tau**2)))
+        tbl_fx_3_2.append(int(v*4096)&0xFFFF)
+    fw.append([L("tbl_fx_3_2"), tbl_fx_3_2])
 
     # output tables.
     # sine of the total for this pixel

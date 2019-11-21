@@ -34,7 +34,7 @@ class BonelessLED(Elaboratable):
         self.uart = uart.SimpleUART(
             default_divisor=uart.calculate_divisor(12e6, 115200))
         self.spi = spi.SimpleSPI(fifo_depth=512)
-        self.mul = multiplier.Multiplier(signed=False)
+        self.mul = multiplier.Multiplier(signed=True)
 
     def elaborate(self, platform):
         uart_pins = platform.request("uart")
