@@ -539,8 +539,10 @@ class PixelReader(Elaboratable):
         m.d.comb += self.col_ctr.enable.eq(should_count)
         should_read = Signal() # are we intending to read a pixel?
         m.d.comb += self.o_re.eq(should_read)
+        # this is probably not logically correct!! it needs to be fixed if we
+        # ever plan to actually stall the pixel reader.
         done_reading = Signal() # did the pixel read finish?
-        m.d.comb += done_reading.eq(self.o_re & self.i_rack)
+        m.d.comb += done_reading.eq(self.i_rack)
 
         # once the pixel read finishes, we want to write it to the buffer.
         # we replicate the read channel data across the 6 memory channels, then
