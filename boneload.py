@@ -945,9 +945,14 @@ def boneload(firmware, port, ram_only=False):
         _flash_wait()
 
     print("Reloading flash data...")
-    _bl_flash_txn_imm(ser, ident[2],
-        write_data=[0x0B,  0x2, 0, 0,  0])
-    _bl_flash_txn(ser, 0, read_len=len(firmware), deassert_cs=True)
+    for page in range(num_pages):
+        addr = ((page+512)*page_size).to_bytes(3, byteorder="big")
+        # start read operation
+        _bl_flash_txn_imm(ser, ident[2],
+            write_data=[0x0B,  *addr,  0])
+        # and actually read the data
+        _bl_flash_txn(ser, page*128,
+            read_len=min((len(firmware)-(page*128))*2, 256), deassert_cs=True)
     print("Verifying flash...")
     calc_crc = _bl_crc(ser, 0, len(firmware))
     if calc_crc != correct_crc:
