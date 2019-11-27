@@ -46,12 +46,12 @@
 #   from $FF00 to $FFFF, and overwriting it would be bad.
 
 # command 3: jump to code
-#   length: 2
-#   parameter words: destination address, new W address
-#   result codes: success, execution complete, invalid length
-#   purpose: jump to bootloaded code. W is loaded before the jump. entering into
-#       the code, R7 will have return address and R6 will have previous W.
-#       succese is before jump, execution complete is sent if jump returns.
+#   length: 1
+#   parameter words: destination address
+#   result codes: success, invalid length
+#   purpose: jump to given address. register values are undefined after the
+#            jump. W points to EXACTLY ONE valid register window. W MUST BE SET
+#            EXPLICITLY before any W-relative/adjust instructions are used. 
 
 # command 4: read data
 #   length: 2
@@ -569,23 +569,21 @@ def _bfw_main(uart_addr, spi_addr):
         J("tx_packet"),
     ])
     r -= "src_addr copy_tmp"
-    r += "R6:dest_code R4:dest_w"
+    r += "R6:code_addr"
     fw.append([
     L("sys_cmd_jump_to_code"),
-        # jump to some downloaded code
-        CMPI(r.length, 2),
+        # jump to some address
+        CMPI(r.length, 1),
         BNE("sys_packet_tx_invalid_length"),
-        LD(r.dest_code, r.buf_ptr, 0),
-        LD(r.dest_w, r.buf_ptr, 1),
-        # tell the host that we successfully got everything before we jump into
-        # the app code
+        LD(r.code_addr, r.buf_ptr, 0),
+        # tell the host that we successfully got everything before we give up
+        # control
         MOVI(r.result_code, 0x0100),
         JAL(r.lr, "tx_packet"),
-        XCHW(R7, r.dest_w), # set new W and store current one
-        LD(R7, R7, int(r.dest_code)), # get jump destination from current frame
-        JR(R7, 0), # and jump to it
+        # now we can start running the new program
+        JR(r.code_addr, 0),
     ])
-    r -= "dest_code dest_w result_code"
+    r -= "code_addr result_code"
     r += "R6:fp R5:crc_start R4:crc_end R3:crc_result"
     fw.append([
     L("sys_cmd_crc"),
@@ -788,8 +786,8 @@ def _bl_write_data(ser, addr, data, max_len):
             raise Exception("huh? {} {}".format(r, p))
         written += to_write
 
-def _bl_jump_to_code(ser, addr, w):
-    r, p = _bl_command(ser, 3, [addr, w])
+def _bl_jump_to_code(ser, addr):
+    r, p = _bl_command(ser, 3, [addr])
     if r != 1:
         raise Exception("huh? {} {}".format(r, p))
 
@@ -959,7 +957,7 @@ def boneload(firmware, port, ram_only=False):
         raise Exception("verification failed!", calc_crc, correct_crc)
 
     print("Beginning execution...")
-    _bl_jump_to_code(ser, 0, 0xFFF)
+    _bl_jump_to_code(ser, 0)
     print("Complete!")
 
 if __name__ == "__main__":
