@@ -317,9 +317,9 @@ def _bfw_tx_packet(uart_addr):
         ANDI(r.tx_space, r.tx_space, 1),
         BZ0(lp+"tx_byte"),
         # then send the byte
-        ANDI(r.tx_space, r.tx_word, 0xFF),
-        STXA(r.tx_space, uart_addr+2),
-        JR(R7, 0),
+        # (it's automatically ANDed with 0xFF cause the UART register is 8 bits)
+        STXA(r.tx_word, uart_addr+2),
+        JR(r.lr, 0),
     ])
 
     return fw
@@ -440,7 +440,7 @@ def _bfw_flash_boot():
     ]
 
 
-def _bfw_main(uart_addr, spi_addr, mini):
+def _bfw_main(uart_addr, spi_addr):
     max_length = 16 # adjust to fill memory
     fw = []
 
@@ -481,33 +481,26 @@ def _bfw_main(uart_addr, spi_addr, mini):
         BEQ("sys_cmd_write_data"),
         SUBI(r.command, r.command, 1), # command 3
         BEQ("sys_cmd_jump_to_code"),
-    ])
-    if not mini:
-        fw.append([
-            SUBI(r.command, r.command, 1), # command 4
-            BEQ("sys_cmd_read_data"),
-            SUBI(r.command, r.command, 1), # command 5
-            BEQ("sys_cmd_crc"),
-            SUBI(r.command, r.command, 1), # command 6
-            BEQ("sys_cmd_flash_txn_imm"),
-            SUBI(r.command, r.command, 1), # command 7
-            BEQ("sys_cmd_flash_txn"),
-        ])
-    fw.append([
+        SUBI(r.command, r.command, 1), # command 4
+        BEQ("sys_cmd_read_data"),
+        SUBI(r.command, r.command, 1), # command 5
+        BEQ("sys_cmd_crc"),
+        SUBI(r.command, r.command, 1), # command 6
+        BEQ("sys_cmd_flash_txn_imm"),
+        SUBI(r.command, r.command, 1), # command 7
+        BEQ("sys_cmd_flash_txn"),
         # oh no, we don't know what the command is
         # fortunately, a result of 0 also = bad command
         J("sys_packet_tx_issue"),
+    ])
+    r -= "fp command"
+    fw.append([
     L("sys_packet_tx_invalid_length"),
         MOVI(r.result_code, 1),
         # fall through to tx issue packet
-    ])
-    r -= "fp command"
-    r += "R6:zero"
-    fw.append([
     L("sys_packet_tx_issue"), # send error packet with problem in result_code
         # store the problem into the packet
-        MOVI(r.zero, 0),
-        STR(r.result_code, r.zero, "pb_data"),
+        ST(r.result_code, r.buf_ptr, 0),
         # result code 2 with length 1
         MOVI(r.result_code, 0x0201),
         J("tx_packet"), # LR is set to return to sys_packet_rx
@@ -516,7 +509,6 @@ def _bfw_main(uart_addr, spi_addr, mini):
         MOVI(r.result_code, 0x0100),
         J("tx_packet"), # LR is set to return to sys_packet_rx
     ])
-    r -= "zero"
     r += "R6:ident_info"
     fw.append([
     L("sys_cmd_identify"),
@@ -524,8 +516,7 @@ def _bfw_main(uart_addr, spi_addr, mini):
         CMPI(r.length, 0),
         BNE("sys_packet_tx_invalid_length"),
         # write identification data to buffer
-        MOVR(r.buf_ptr, "pb_data"),
-        MOVI(r.ident_info, 1 | (0 if mini else 0x8000)), # boot version
+        MOVI(r.ident_info, 1), # boot version
         ST(r.ident_info, r.buf_ptr, 0),
         MOVI(r.ident_info, 0x69), # board id
         ST(r.ident_info, r.buf_ptr, 1),
@@ -536,50 +527,48 @@ def _bfw_main(uart_addr, spi_addr, mini):
         J("tx_packet"), # LR is set to return to sys_packet_rx
     ])
     r -= "ident_info"
-    r += "R6:dest_addr R4:copy_tmp"
+    r += "R6:dest_addr R4:copy_tmp R2:buf_idx"
     fw.append([
     L("sys_cmd_write_data"),
         # write some data to some address
         CMPI(r.length, 0),
         BEQ("sys_packet_tx_invalid_length"), # we need at least an address
         LD(r.dest_addr, r.buf_ptr, 0), # dest addr
-        MOVI(r.buf_ptr, 1), # current pos
+        MOVI(r.buf_idx, 1), # current pos
     L("_scwd_copy"),
-        LDR(r.copy_tmp, r.buf_ptr, "pb_data"),
+        LDR(r.copy_tmp, r.buf_idx, "pb_data"),
         ST(r.copy_tmp, r.dest_addr, 0),
         ADDI(r.dest_addr, r.dest_addr, 1),
-        ADDI(r.buf_ptr, r.buf_ptr, 1),
-        CMP(r.buf_ptr, r.length),
+        ADDI(r.buf_idx, r.buf_idx, 1),
+        CMP(r.buf_idx, r.length),
         BNE("_scwd_copy"),
         J("sys_packet_tx_success"),
     ])
-    r -= "dest_addr copy_tmp"
-    if not mini:
-        # handle read data command
-        r += "R6:src_addr R4:copy_tmp"
-        fw.append([
-        L("sys_cmd_read_data"),
-            # read some data from some address
-            CMPI(r.length, 2),
-            BNE("sys_packet_tx_invalid_length"),
-            LD(r.src_addr, r.buf_ptr, 0), # src address
-            LD(r.length, r.buf_ptr, 1), # number of words to copy
-            # which is the number of words returned (plus result type 4)
-            ORI(r.result_code, r.length, 4<<8),
-            CMPI(r.length, max_length),
-            BGTU("sys_packet_tx_invalid_length"),
-            MOVI(r.buf_ptr, 0),
-        L("_scrd_copy"),
-            LD(r.copy_tmp, r.src_addr, 0),
-            STR(r.copy_tmp, r.buf_ptr, "pb_data"),
-            ADDI(r.src_addr, r.src_addr, 1),
-            ADDI(r.buf_ptr, r.buf_ptr, 1),
-            CMP(r.buf_ptr, r.length),
-            BNE("_scrd_copy"),
-            # result code already set before the loop
-            J("tx_packet"),
-        ])
-        r -= "src_addr copy_tmp"
+    r -= "dest_addr copy_tmp buf_idx"
+    r += "R6:src_addr R4:copy_tmp R2:buf_idx"
+    fw.append([
+    L("sys_cmd_read_data"),
+        # read some data from some address
+        CMPI(r.length, 2),
+        BNE("sys_packet_tx_invalid_length"),
+        LD(r.src_addr, r.buf_ptr, 0), # src address
+        LD(r.length, r.buf_ptr, 1), # number of words to copy
+        # which is the number of words returned (plus result type 4)
+        ORI(r.result_code, r.length, 4<<8),
+        CMPI(r.length, max_length),
+        BGTU("sys_packet_tx_invalid_length"),
+        MOVI(r.buf_idx, 0),
+    L("_scrd_copy"),
+        LD(r.copy_tmp, r.src_addr, 0),
+        STR(r.copy_tmp, r.buf_idx, "pb_data"),
+        ADDI(r.src_addr, r.src_addr, 1),
+        ADDI(r.buf_idx, r.buf_idx, 1),
+        CMP(r.buf_idx, r.length),
+        BNE("_scrd_copy"),
+        # result code already set before the loop
+        J("tx_packet"),
+    ])
+    r -= "src_addr copy_tmp"
     r += "R6:dest_code R4:dest_w"
     fw.append([
     L("sys_cmd_jump_to_code"),
@@ -597,77 +586,75 @@ def _bfw_main(uart_addr, spi_addr, mini):
         JR(R7, 0), # and jump to it
     ])
     r -= "dest_code dest_w result_code"
-    if not mini:
-        # handle crc write, flash immediate, and flash ram commands
-        r += "R6:fp R5:crc_start R4:crc_end R3:crc_result"
-        fw.append([
-        L("sys_cmd_crc"),
-            # calculate CRC of some memory
-            CMPI(r.length, 2),
-            BNE("sys_packet_tx_invalid_length"),
-            LD(r.crc_start, r.buf_ptr, 0),
-            LD(r.crc_end, r.buf_ptr, 1),
-            JAL(r.lr, "calc_crc"),
-            LD(r.crc_result, r.fp, -8+0),
-            ST(r.crc_result, r.buf_ptr, 0),
-        ])
-        r -= "fp crc_start crc_end crc_result"
-        r += "R5:result_code"
-        fw.append([
-            MOVI(r.result_code, 0x0301), # result type 3 of length 1
-            # restore LR to main loop since we just used it above
-            MOVR(r.lr, "sys_packet_rx"),
-            J("tx_packet"),
-        ])
-        r -= "result_code"
-        r += "R6:is_write R5:engine_cmd R4:txn_buf R3:txn_length"
-        fw.append([
-        L("sys_cmd_flash_txn_imm"),
-            # do a flash transaction using command data
-            CMPI(r.length, 0),
-            BEQ("sys_packet_tx_invalid_length"), # we need at least a command
-            LD(r.engine_cmd, r.buf_ptr, 0),
-            # make sure we don't transact into uncharted territory
-            ANDI(r.txn_length, r.engine_cmd, 0xFFF),
-            CMPI(r.txn_length, 2*(max_length-1)),
-            BGTU("sys_packet_tx_invalid_length"),
-            MOV(r.txn_buf, r.buf_ptr),
-            # if this is a write transaction, the buffer starts 1 in
-            ANDI(r.is_write, r.engine_cmd, 0x8000),
-            BS0("_scfti_rd"),
-            ADDI(r.txn_buf, r.txn_buf, 1),
-        L("_scfti_rd"),
-            JAL(r.lr, "flash_txn"), # do the operation
-        ])
-        r -= "engine_cmd"
-        r += "R5:result_code"
-        fw.append([
-            # ensure we return back to the main loop (since we overwrote LR)
-            MOVR(r.lr, "sys_packet_rx"),
-            ANDI(r.is_write, r.is_write, 0x8000),
-            BS1("sys_packet_tx_success"),
-            # if this is read, we need to send the data back.
-            # calculate the respone length, in words.
-            ADDI(r.result_code, r.txn_length, 1), # round up
-            SRLI(r.result_code, r.result_code, 1),
-            ORI(r.result_code, r.result_code, 4<<8), # set read result type
-            J("tx_packet"), # and do it
-        ])
-        r -= "is_write txn_buf txn_length result_code"
-        r += "R5:engine_cmd R4:txn_buf"
-        fw.append([
-        L("sys_cmd_flash_txn"),
-            # do a flash transaction using data in RAM
-            CMPI(r.length, 2),
-            BNE("sys_packet_tx_invalid_length"),
-            LD(r.engine_cmd, r.buf_ptr, 0),
-            LD(r.txn_buf, r.buf_ptr, 1),
-            JAL(r.lr, "flash_txn"),
-            # restore LR to main loop since we just used it above
-            MOVR(r.lr, "sys_packet_rx"),
-            J("sys_packet_tx_success"),
-        ])
-        r -= "engine_cmd"
+    r += "R6:fp R5:crc_start R4:crc_end R3:crc_result"
+    fw.append([
+    L("sys_cmd_crc"),
+        # calculate CRC of some memory
+        CMPI(r.length, 2),
+        BNE("sys_packet_tx_invalid_length"),
+        LD(r.crc_start, r.buf_ptr, 0),
+        LD(r.crc_end, r.buf_ptr, 1),
+        JAL(r.lr, "calc_crc"),
+        LD(r.crc_result, r.fp, -8+0),
+        ST(r.crc_result, r.buf_ptr, 0),
+    ])
+    r -= "fp crc_start crc_end crc_result"
+    r += "R5:result_code"
+    fw.append([
+        MOVI(r.result_code, 0x0301), # result type 3 of length 1
+        # restore LR to main loop since we just used it above
+        MOVR(r.lr, "sys_packet_rx"),
+        J("tx_packet"),
+    ])
+    r -= "result_code"
+    r += "R6:is_write R5:engine_cmd R4:txn_buf R3:txn_length"
+    fw.append([
+    L("sys_cmd_flash_txn_imm"),
+        # do a flash transaction using command data
+        CMPI(r.length, 0),
+        BEQ("sys_packet_tx_invalid_length"), # we need at least a command
+        LD(r.engine_cmd, r.buf_ptr, 0),
+        # make sure we don't transact into uncharted territory
+        ANDI(r.txn_length, r.engine_cmd, 0xFFF),
+        CMPI(r.txn_length, 2*(max_length-1)),
+        BGTU("sys_packet_tx_invalid_length"),
+        MOV(r.txn_buf, r.buf_ptr),
+        # if this is a write transaction, the buffer starts 1 in
+        ANDI(r.is_write, r.engine_cmd, 0x8000),
+        BS0("_scfti_rd"),
+        ADDI(r.txn_buf, r.txn_buf, 1),
+    L("_scfti_rd"),
+        JAL(r.lr, "flash_txn"), # do the operation
+    ])
+    r -= "engine_cmd"
+    r += "R5:result_code"
+    fw.append([
+        # ensure we return back to the main loop (since we overwrote LR)
+        MOVR(r.lr, "sys_packet_rx"),
+        ANDI(r.is_write, r.is_write, 0x8000),
+        BS1("sys_packet_tx_success"),
+        # if this is read, we need to send the data back.
+        # calculate the respone length, in words.
+        ADDI(r.result_code, r.txn_length, 1), # round up
+        SRLI(r.result_code, r.result_code, 1),
+        ORI(r.result_code, r.result_code, 4<<8), # set read result type
+        J("tx_packet"), # and do it
+    ])
+    r -= "is_write txn_buf txn_length result_code"
+    r += "R5:engine_cmd R4:txn_buf"
+    fw.append([
+    L("sys_cmd_flash_txn"),
+        # do a flash transaction using data in RAM
+        CMPI(r.length, 2),
+        BNE("sys_packet_tx_invalid_length"),
+        LD(r.engine_cmd, r.buf_ptr, 0),
+        LD(r.txn_buf, r.buf_ptr, 1),
+        JAL(r.lr, "flash_txn"),
+        # restore LR to main loop since we just used it above
+        MOVR(r.lr, "sys_packet_rx"),
+        J("sys_packet_tx_success"),
+    ])
+    r -= "engine_cmd"
     r += "R5:result_code"
     fw.append([ # declare subroutines
     L("calc_crc"),
@@ -706,8 +693,8 @@ def _bfw_main(uart_addr, spi_addr, mini):
 
     return fw
 
-def boneload_fw(uart_addr=0, spi_addr=16, mini=False):
-    return Instr.assemble(_bfw_main(uart_addr, spi_addr, mini))
+def boneload_fw(uart_addr=0, spi_addr=16):
+    return Instr.assemble(_bfw_main(uart_addr, spi_addr))
 
 # implementation taken from crcany
 def _crc(words):
@@ -786,7 +773,10 @@ def _bl_command(ser, command, params):
     return response, words[1:]
 
 def _bl_identify(ser):
-    return _bl_command(ser, 1, [])[1]
+    r, p = _bl_command(ser, 1, [])
+    if r != 5:
+        raise Exception("huh? {} {}".format(r, p))
+    return p
 
 def _bl_write_data(ser, addr, data, max_len):
     written = 0
@@ -884,7 +874,7 @@ def boneload(firmware, port, ram_only=False):
         except Timeout:
             pass
 
-    if ident[0] != 0x8001:
+    if ident[0] != 1:
         raise Exception("incompatible version {}".format(ident[0]))
 
     print("Identified! Board ID=0x{:02X}, max length={}".format(*ident[1:]))
@@ -968,7 +958,7 @@ def boneload(firmware, port, ram_only=False):
     print("Complete!")
 
 if __name__ == "__main__":
-    f = boneload_fw(mini=True)
+    f = boneload_fw()
     for w in f:
         print(Instr.disassemble([w]))
     x = len(f)
