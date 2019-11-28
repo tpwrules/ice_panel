@@ -1,6 +1,19 @@
 # the boneless register allocator!
 # absolutely not time efficient in any way
 
+# SOME RESOURCES I USED
+# https://www.cs.umd.edu/class/spring2014/cmsc430/lectures/lec19.pdf
+# http://www.cs.cmu.edu/afs/cs/academic/class/15745-s13
+#       /public/lectures/L15-Register-Allocation.pdf
+# https://web.cecs.pdx.edu/~apt/cs322/lecture10.pdf
+# http://www.cs.utexas.edu/users/mckinley/380C/lecs/briggs-thesis-1992.pdf
+# https://courses.cs.cornell.edu/cs412/2004sp/lectures/lec36.pdf
+# https://www.cs.rice.edu/~keith/EMBED/dom.pdf
+# https://pp.info.uni-karlsruhe.de/uploads/publikationen/braun13cc.pdf
+# https://cseweb.ucsd.edu/classes/fa03/cse231/lec5seq.pdf
+# https://sites.cs.ucsb.edu/~yufeiding/cs293s/slides/293S_06_SSA.pdf
+# https://www.cs.colostate.edu/~mstrout/CS553/slides/lecture03.pdf
+
 from boneless.gateware import ALSRU_4LUT, CoreFSM
 from boneless.arch.opcode import Instr
 from boneless.arch.opcode import *
