@@ -13,8 +13,8 @@ def test_1():
     alloc.add_code([
         MOVI(r.a, 0),
     L("loop"),
-        ADDI(r.b, r.a, 1),
-        ADD(r.c, r.c, r.b),
+        [ADDI(r.b, r.a, 1),
+        [ADD(r.c, r.c, r.b)],],
         SLLI(r.a, r.b, 1),
         CMPI(r.a, 9),
         BLTU("loop"),
@@ -26,6 +26,10 @@ def test_1():
 def test_2():
     alloc = RegisterAllocator()
     r = alloc.tracker
+
+    panel_w = 32
+    panel_h = 16
+    extra_lines = 4
 
     buf_w = panel_w
     buf_h = panel_h+extra_lines
