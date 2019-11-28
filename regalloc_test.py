@@ -141,4 +141,4 @@ def test_2():
 
     return alloc.allocate()
 
-print(test_1()) # execute the test, who knows what will happen
+print(test_2()) # execute the test, who knows what will happen
