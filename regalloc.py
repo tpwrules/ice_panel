@@ -151,25 +151,38 @@ class RegisterAllocator:
                 # regs that this instruction defines are defined within this BB
                 bb.r_out.update(insn.r_out)
 
+        # freeze each BB so that other functions can't touch it and the return
+        # of this function can always be reused. (it's ok that we didn't freeze
+        # them earlier since we make them and know how we use them)
+        for bb_ident, bb in bbs.items():
+            bbs[bb_ident] = BasicBlock(
+                insns=tuple(bb.insns),
+                sources=frozenset(bb.sources),
+                targets=frozenset(bb.targets),
+                r_in=frozenset(bb.r_in),
+                r_out=frozenset(bb.r_out),
+            )
+
         return bbs
 
     # uniquely number each definition of each register and its usages
     @classmethod
-    def _renumber_regs(cls, bbs_in):
+    def _renumber_regs(cls, bbs):
         # we convert the register numbers to vaguely SSA.
         # first thing is to give each output register its own "generation".
         # i.e. if one register is an output on two basic blocks, each register
         # gets a different generation.
         gens = {} # dict from register number to latest generation number
-        bbs = {} # basic blocks with renumbered output registers
-        for bb_ident, bb in bbs_in.items():
+        def add_generation(bb):
             r_out_genned = set()
             # replace each register number with (reg num, generation)
             for r_out in bb.r_out:
                 gen = gens.get(r_out, 1)
                 gens[r_out] = gen+1
                 r_out_genned.add((r_out, gen))
-            bbs[bb_ident] = bb._replace(r_out=r_out_genned)
+            return bb._replace(r_out=frozenset(r_out_genned))
+        # rebuild dict so we don't modify the one passed in
+        bbs = {bb_ident: add_generation(bb) for bb_ident, bb in bbs.items()}
 
         # then the second thing is to figure out which generation might be
         # available for each input register. we do this by computing the
@@ -205,9 +218,7 @@ class RegisterAllocator:
 
         # now we can figure out which generation each BB uses as input based on
         # what's reachable to that BB
-        bbs_in = bbs # we recreate the BBs with new input register sets
-        bbs = {}
-        for bb_ident, bb in bbs_in.items():
+        for bb_ident, bb in bbs.items():
             r_in_genned = set()
             # every reachable variable is a candidate for this BB. note that we
             # add multiple generations if available; those will be resolved
@@ -217,7 +228,7 @@ class RegisterAllocator:
             for r_in, r_in_gen in reachable[bb_ident]:
                 if r_in in bb.r_in:
                     r_in_genned.add((r_in, r_in_gen))
-            bbs[bb_ident] = bb._replace(r_in=r_in_genned)
+            bbs[bb_ident] = bb._replace(r_in=frozenset(r_in_genned))
 
         return bbs
 
@@ -269,42 +280,42 @@ class RegisterTracker:
         return self._regs.setdefault(name, len(self._regs))
 
 # decoded boneless instruction
-class Insn:
+_i_fields = [
+    # OTHER PEOPLE'S PROPERTIES
+    "r_in",    # frozenset of register numbers used by this insn
+    "r_out",   # r_out: frozenset of register numbers defined by ths insn
+    "targets", # targets: frozenset of possible control flow targets.
+               #     None = next instruction
+               #     str = label with that name
+               #     int = register with that number
+    # OUR PROPERTIES
+    # we save the information required to reconstruct the Instr that we were
+    # built from so that we can generate unique objects with different register
+    # mappings as necessary, instead of just modifying the same one.
+    "instr_type",   # type object of the instr that made this insn
+    "instr_fields", # dict mapping insn field names to register numbers (rN)
+                    #     or values (imm)
+]
+class Insn(namedtuple("Insn", _i_fields)):
     # instructions that branch to a label (not including aliases)
     INSTRS_BRANCH = {BZ1, BZ0, BS1, BS0, BC1, BC0, BV1, BV0,
         BGTS, BGTU, BGES, BLES, BLEU, BLTS}
     # instructions where rsd is a source
     INSTRS_RSD_SOURCE = {ST, STR, STX, STXA}
 
-    def __init__(self, instr):
-        # what we should init:
-        # OTHER PEOPLE'S PROPERTIES
-        # r_in: set of register numbers used by this insn
-        # r_out: set of register numbers defined by ths insn
-        # targets: set of possible control flow targets.
-        #         None = next instruction
-        #         str = label with that name
-        #         int = register with that number
-
-        # OUR PROPERTIES
-        # we save the information required to reconstruct the Instr that we were
-        # built from so that we can generate unique ones with different register
-        # mappings as necessary, instead of just modifying the same one.
-        # instr_type: type object of the instr that made this insn
-        # instr_fields: dict mapping insn field names to register numbers (rN)
-        #               or values (imm)
-
+    def __new__(cls, instr):
         # hack for R_USE cause it's not a boneless instr
         if isinstance(instr, R_USE):
-            self.instr_type = R_USE
-            self.instr_fields = {"rsd": instr.rsd}
-            self.r_in = {instr.rsd}
-            self.r_out = set()
-            self.targets = {None}
-            return
+            return super(Insn, cls).__new__(cls,
+                r_in=frozenset((instr.rsd,)),
+                r_out=frozenset(),
+                targets=frozenset((None,)),
+                instr_type=R_USE,
+                instr_fields={"rsd": instr.rsd},
+            )
 
         # first, take apart the instr into its component parts
-        self.instr_type = type(instr)
+        instr_type = type(instr)
         instr_fields = {}
         for field in instr._field_types:
             v = getattr(instr, "_"+field)
@@ -314,63 +325,62 @@ class Insn:
             else:
                 # convert immediates to strings if possible
                 instr_fields[field] = v.value
-        self.instr_fields = instr_fields
 
         # second, un-alias the instruction so we have a common type
-        instr_type = type(instr)
-        while instr_type.alias is True:
+        instr_base_type = instr_type
+        while instr_base_type.alias is True:
             # the only superclass of an alias is the original instruction class
-            instr_type = instr_type.__bases__[0]
+            instr_base_type = instr_base_type.__bases__[0]
 
         # default flow properties
-        self.r_in = set()
-        self.r_out = set()
-        self.targets = {None}
+        r_in = set()
+        r_out = set()
+        targets = {None}
         
         # third, figure out what exactly that type means
-        if instr_type in Insn.INSTRS_BRANCH:
+        if instr_base_type in Insn.INSTRS_BRANCH:
             dest = instr_fields["imm"]
             if not isinstance(dest, str):
                 raise ValueError(
                     "branch target must be str, which '{}' is not".format(dest))
             # target is the next instruction or the branch's destination
-            self.targets = {dest, None}
-        elif instr_type is J:
+            targets = {dest, None}
+        elif instr_base_type is J:
             # unconditional jump, no registers, and target is label
             dest = instr_fields["imm"]
             if not isinstance(dest, str):
                 raise ValueError(
                     "jump target must be str, which '{}' is not".format(dest))
-            self.targets = {dest}
-        elif instr_type is JR:
+            targets = {dest}
+        elif instr_base_type is JR:
             # register-based jump
             if instr_fields["imm"] != 0:
                 raise ValueError(
                     "JR offset must be 0, which '{}' is not".format(dest))
             # we depend on the jump target register
-            self.r_in = {instr_fields["rsd"]}
+            r_in = {instr_fields["rsd"]}
             # and that's where we go always
-            self.targets = {instr_fields["rsd"]}
-        elif instr_type is JRAL:
+            targets = {instr_fields["rsd"]}
+        elif instr_base_type is JRAL:
             # jump to register and save next pc in register
-            self.r_in = {instr_fields["rb"]}
-            self.r_out = {instr_fields["rsd"]}
+            r_in = {instr_fields["rb"]}
+            r_out = {instr_fields["rsd"]}
             # for subroutine calls, we assume the call will eventually return
             # back to where it started. if we didn't have to allocate registers
             # for the target (e.g. it was a different procedure) then the user
             # would write that differently.
-            self.targets = {instr_fields["rb"], None}
-        elif instr_type is JVT or instr_type is JST:
+            targets = {instr_fields["rb"], None}
+        elif instr_base_type is JVT or instr_base_type is JST:
             raise ValueError("can't yet allocate JVT or JST")
-        elif instr_type is JAL:
+        elif instr_base_type is JAL:
             # jump to target and save next pc in register
-            self.r_out = {instr_fields["rsd"]}
+            r_out = {instr_fields["rsd"]}
             if not isinstance(instr_fields["imm"], str):
                 raise ValueError(
                     "JAL target must be str, which '{}' is not".format(dest))
             # see commentary in JRAL
-            self.targets = {instr_fields["imm"], None}
-        elif instr_type is NOP:
+            targets = {instr_fields["imm"], None}
+        elif instr_base_type is NOP:
             # encoded as conditional jump, but it doesn't depend on anything.
             # the default is fine.
             pass
@@ -378,17 +388,26 @@ class Insn:
             # just a generic instruction with whatever function.
             # ra and rb are always inputs.
             ra = instr_fields.get("ra")
-            if ra is not None: self.r_in.add(ra)
+            if ra is not None: r_in.add(ra)
             rb = instr_fields.get("rb")
-            if rb is not None: self.r_in.add(rb)
+            if rb is not None: r_in.add(rb)
             rsd = instr_fields.get("rsd")
             if rsd is not None:
-                if instr_type in Insn.INSTRS_RSD_SOURCE:
+                if instr_base_type in Insn.INSTRS_RSD_SOURCE:
                     # rsd might be an input too for a few rare instructions
-                    self.r_in.add(rsd)
+                    r_in.add(rsd)
                 else:
                     # but it's usually an output
-                    self.r_out = {instr_fields["rsd"]}
+                    r_out = {instr_fields["rsd"]}
+
+        # freeze everything and return the data
+        return super(Insn, cls).__new__(cls,
+            r_in=frozenset(r_in),
+            r_out=frozenset(r_out),
+            targets=frozenset(targets),
+            instr_type=instr_type,
+            instr_fields=instr_fields,
+        )
             
     def __repr__(self):
         # only include parts that actually exist to shorten representation
@@ -396,19 +415,23 @@ class Insn:
             "Insn(",
             # get instruction name from its class
             "type={}".format(str(self.instr_type).split(".")[-1][:-2]),
-            (", r_in={}".format(self.r_in)) if len(self.r_in) > 0 else "",
-            (", r_out={}".format(self.r_out)) if len(self.r_out) > 0 else "",
-            (", targets={}".format(self.targets))
+            # convert frozensets to sets to avoid displaying frozenset()
+            (", r_in={}".format(set(self.r_in))) if len(self.r_in) > 0 else "",
+            (", r_out={}".format(set(self.r_out)))
+                if len(self.r_out) > 0 else "",
+            (", targets={}".format(set(self.targets)))
                 if len(self.targets) > 1 or None not in self.targets else "",
             ")",
         ]
         return "".join(s)
 
+del _i_fields # avoid cluttering namespace
+
 # basic block type
 BasicBlock = namedtuple("BasicBlock", [
-    "insns", # list of instructions in this basic block
-    "r_in", # set of registers used by this basic block
-    "r_out", # set of registers defined by this basic block
-    "sources", # set of basic blocks that may jump to us
-    "targets", # set of basic blocks that we may jump to
+    "insns", # tuple of instructions in this basic block
+    "r_in", # frozenset of registers used by this basic block
+    "r_out", # frozenset of registers defined by this basic block
+    "sources", # frozenset of basic blocks that may jump to us
+    "targets", # frozenset of basic blocks that we may jump to
 ])
