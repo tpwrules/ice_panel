@@ -126,7 +126,7 @@ class RegisterAllocator:
             bb = BasicBlock(
                 insns=insns, targets=targets,
                 # we calculate these later
-                r_in=set(), r_out=set(), sources=set(),
+                r_use=set(), r_def=set(), sources=set(),
             )
             bbs[bb_start] = bb
 
@@ -146,10 +146,10 @@ class RegisterAllocator:
         for bb_ident, bb in bbs.items():
             for insn in bb.insns:
                 # regs that this instruction uses must come from outside this BB
-                # unless they are already defined
-                bb.r_in.update(insn.r_in - bb.r_out)
-                # regs that this instruction defines are defined within this BB
-                bb.r_out.update(insn.r_out)
+                # unless they are already defined by a previous instruction
+                bb.r_use.update(insn.r_use - bb.r_def)
+                # regs that this instruction defines are defined by this BB
+                bb.r_def.update(insn.r_def)
 
         # freeze each BB so that other functions can't touch it and the return
         # of this function can always be reused. (it's ok that we didn't freeze
@@ -159,179 +159,198 @@ class RegisterAllocator:
                 insns=tuple(bb.insns),
                 sources=frozenset(bb.sources),
                 targets=frozenset(bb.targets),
-                r_in=frozenset(bb.r_in),
-                r_out=frozenset(bb.r_out),
+                r_use=frozenset(bb.r_use),
+                r_def=frozenset(bb.r_def),
             )
 
         return bbs
 
-    # uniquely number each definition of each register and its usages
+    # re"number" each register such that each returned register name represents
+    # one virtual register that can't be assigned the same physical register as
+    # another virtual register with an overlapping lifetime. instead of numbers,
+    # registers are returned named as tuples.
     @classmethod
     def _renumber_regs(cls, bbs):
-        # we convert the register numbers to vaguely SSA.
-        # first thing is to give each output register its own "generation".
-        # i.e. if one register is an output on two basic blocks, each register
+        # basically, we renumber the registers so that they're vaguely SSA
+
+        # first thing is to give each register definition its own "generation".
+        # i.e. if one register is defined by two basic blocks, each register
         # gets a different generation.
         gens = {} # dict from register number to latest generation number
         def add_generation(bb):
-            r_out_genned = set()
+            r_def_genned = set()
             # replace each register number with (reg num, generation)
-            for r_out in bb.r_out:
-                gen = gens.get(r_out, 1)
-                gens[r_out] = gen+1
-                r_out_genned.add((r_out, gen))
-            return bb._replace(r_out=frozenset(r_out_genned))
+            for r_def in bb.r_def:
+                gen = gens.get(r_def, 1)
+                gens[r_def] = gen+1
+                r_def_genned.add((r_def, gen))
+            return bb._replace(r_def=frozenset(r_def_genned))
         # rebuild dict so we don't modify the one passed in
         bbs = {bb_ident: add_generation(bb) for bb_ident, bb in bbs.items()}
 
-        # then the second thing is to figure out which generation might be
-        # available for each input register. we do this by computing the
-        # "reachability": which generations of what regsters are available at
-        # each BB.
+        # the second thing is to figure out which generations will be defined at
+        # the point of each register use. we do this by computing the
+        # "reachability": which generations of what registers will be defined by
+        # the time each BB is entered.
 
-        # dict for reachability from BB ident to set of register, generation
-        # tuples that are available to that BB.
+        # dict from BB ident to set of (reg, gen) tuples that reach that BB
         reachable = {bb_ident: set() for bb_ident in bbs.keys()}
-        # dict from BB ident to set of registers that that BB redefines
-        redefined = {}
+        # dict from BB ident to set of registers that that BB defines
+        defined = {}
         for bb_ident, bb in bbs.items():
-            redefined[bb_ident] = set(r_out for r_out, r_out_gen in bb.r_out)
-        changed = True # loop until we've stopped updating the dict
+            defined[bb_ident] = set(r_def for r_def, r_def_gen in bb.r_def)
+        changed = True # loop until we've stopped updating reachability
         while changed:
             changed = False
             for bb_ident, bb in bbs.items():
-                new_reachers = set()
+                reaching_defs = set()
                 # look through all the BBs that lead to us
                 for bb_pred_ident in bb.sources:
                     bb_pred = bbs[bb_pred_ident]
-                    # any register generations in that BB must reach us
-                    new_reachers |= bb_pred.r_out
+                    # all the generations defined by that BB must reach us
+                    reaching_defs |= bb_pred.r_def
                     # as well as any generations that reach that BB, so long as
-                    # the BB does not redefine them into a new generation!
-                    for r_out, r_out_gen in reachable[bb_pred_ident]:
-                        if r_out not in redefined[bb_pred_ident]:
-                            new_reachers.add((r_out, r_out_gen))
+                    # that BB does not redefine them into a new generation!
+                    for r_def, r_def_gen in reachable[bb_pred_ident]:
+                        if r_def not in defined[bb_pred_ident]:
+                            reaching_defs.add((r_def, r_def_gen))
 
-                if len(new_reachers - reachable[bb_ident]): # found new items?
-                    changed = True # we probably need to recalculate other BBs
-                    reachable[bb_ident] = new_reachers
+                if len(reaching_defs - reachable[bb_ident]): # found new defs?
+                    reachable[bb_ident] = reaching_defs
+                    # changing what reaches us might also change what reaches
+                    # other BBs, so we need to recalculate another time
+                    changed = True
 
-        # now we can figure out which generation each BB uses as input based on
-        # what's reachable to that BB
+        # we can figure out which generations each BB might use based on what's
+        # reachable to that BB
         for bb_ident, bb in bbs.items():
-            r_in_genned = set()
-            # every reachable variable is a candidate for this BB. note that we
-            # add multiple generations if available; those will be resolved
-            # later. also note that this BB doesn't need to have registers as
-            # input that it doesn't actually use. its targets already know about
-            # those registers.
-            for r_in, r_in_gen in reachable[bb_ident]:
-                if r_in in bb.r_in:
-                    r_in_genned.add((r_in, r_in_gen))
-            bbs[bb_ident] = bb._replace(r_in=frozenset(r_in_genned))
+            r_use_genned = set()
+            # we mark as used every generation of every register used by this
+            # BB. note that we use multiple generations if available; those will
+            # be merged later. we don't remember generations for registers this
+            # BB doesn't use; its targets will remember if necessary.
+            for r_use, r_use_gen in reachable[bb_ident]:
+                if r_use in bb.r_use:
+                    r_use_genned.add((r_use, r_use_gen))
+            bbs[bb_ident] = bb._replace(r_use=frozenset(r_use_genned))
 
-        # we've calculated what register generations each BB uses for input and
-        # output. but the insns within still don't know. but since they are
-        # straight line code, it's simple to figure out.
+        # we've calculated what register generations each BB uses and defines,
+        # but the insns within still don't know. fortunately, since they are
+        # straight line code, it's straightforward to figure out.
         for bb_ident, bb in bbs.items():
             insns_genned = []
-            # the current generation that each register outputs. since we go
+            # the current generation defined for each register. since we go
             # backwards through the insns, this starts out as the generation
-            # that the BB outputs.
-            out_gen = {r: r_gen for r, r_gen in bb.r_out}
+            # that the BB defines.
+            def_gen = {r: r_gen for r, r_gen in bb.r_def}
             for insn in bb.insns[::-1]:
-                # if this insn outputs a register, it is to the current
-                # generation defined above.
-                r_out = set()
-                for r in insn.r_out:
-                    r_out.add((r, out_gen[r]))
-                    # but! now that this insn has output to it, no other insn
-                    # can (cause this is SSA). any outputs in the future have to
-                    # be to a new generation. additionally, no insns before this
-                    # one have access to this output, so all inputs have to come
-                    # from that generation too.
+                r_def = set()
+                for r in insn.r_def:
+                    # if this insn defines a register, it must define the
+                    # current generation because that's what future insns are
+                    # expecting to use
+                    r_def.add((r, def_gen[r]))
+                    # but! now that this insn has defined that generation, no
+                    # other insn can, cause this is SSA. any other definitions
+                    # have to be to a new generation. additionally, insns before
+                    # this one (i.e. those later in the loop) don't have access
+                    # to this generation, so all usages have to be from that new
+                    # generation too.
                     gen = gens.get(r, 1)
                     gens[r] = gen+1
-                    out_gen[r] = gen
-                # input registers are from the current output as above
-                r_in = set()
-                for r in insn.r_in:
-                    if r not in out_gen:
-                        # haven't seen this input yet but it must come from a
-                        # new generation
+                    def_gen[r] = gen
+                # this insn can only use the currently defined generations
+                r_use = set()
+                for r in insn.r_use:
+                    if r not in def_gen:
+                        # we haven't defined this register yet, which can only
+                        # happen if it was defined earlier in this BB. that
+                        # definition must be to a new generation, cause this is
+                        # still SSA, so create and remember it for when we
+                        # encounter that definition.
                         gen = gens.get(r, 1)
                         gens[r] = gen+1
-                        out_gen[r] = gen
-                    r_in.add((r, out_gen[r]))
-                insns_genned.append(
-                    insn._replace(r_in=frozenset(r_in), r_out=frozenset(r_out)))
-            # the current output generation has to be an input to this BB
-            # because we assumed it would be the input to an insn within this
-            # BB. of course, if this BB doesn't have that register as an input,
-            # then no insn will input it and we don't need to add it.
-            nums_in = set(r for r, r_gen in bb.r_in)
-            r_in = bb.r_in.union(
-                (r, r_gen) for r, r_gen in out_gen.items() if r in nums_in)
+                        def_gen[r] = gen
+                    r_use.add((r, def_gen[r]))
+                insns_genned.append(insn._replace(
+                    r_use=frozenset(r_use), r_def=frozenset(r_def)))
+            # at this point, the currently defined generation for each register
+            # is the generation that must be defined outside this BB. since we
+            # assume that generation will be used by insns within this BB, the
+            # BB has to use them too. of course, if the BB doesn't use that
+            # register, then the assumed insns can't exist, so the BB still
+            # doesn't need to use any generations of that register.
+            # set of registers used by this BB
+            nums_used = set(r for r, r_gen in bb.r_use)
+            r_use = bb.r_use.union(
+                (r, r_gen) for r, r_gen in def_gen.items() if r in nums_used)
             # there is by definition another generation of each register that's
-            # already an input to this BB, but it's okay if we have multiple;
-            # that gets fixed later.
+            # already used by this BB, but it's okay if we have multiple; that
+            # gets fixed later.
             bbs[bb_ident] = bb._replace(
-                r_in=r_in, insns=tuple(insns_genned[::-1]))
+                r_use=r_use, insns=tuple(insns_genned[::-1]))
 
-        # once the above is done, we've left a lot of garbage generations as BB
-        # inputs. the only way for a generation of a register to be a BB input
-        # is if it's used in that BB before (and if) the register is written.
-        # thus, having multiple generations of a register as input means they
-        # MUST be merged to the same generation so that the register refers to
-        # the same value no matter which generation actually reaches the BB.
+        # once the above is done, each BB ends up using a lot of generations of
+        # the same register, each from a different definition. however, the
+        # insns using that register (i.e. from the start of the BB to before any
+        # definitions of it) can only use one particular generation. thus, all
+        # generations of a each register used by this BB MUST be replaced by the
+        # generation actually used by this BB's insns so that all those
+        # definitions will define the one generation that gets used.
 
-        # by the way, this means it's definitely not in SSA anymore
+        # by the way, this makes our BBs definitely not SSA
 
-        # dict from (reg, gen) to (reg, merged_gen)
+        # dict from (reg, gen) to (reg, replaced_gen)
         gen_map = {}
         # first we go through and figure out which generations need to be
-        # merged, and to what
+        # replaced, and by what
         for bb in bbs.values():
-            # sort tuples into dict of reg to set of gens
-            in_gens = {}
-            for r, r_gen in bb.r_in:
-                in_gens.setdefault(r, set()).add(r_gen)
-            # now we can figure out which variables have multiple gens input
-            for r, r_gens in in_gens.items():
-                if len(r_gens) == 1:
-                    # if only one generation is available, we can't merge it
+            # sort the (reg, gen) tuples used by this BB into dict of reg to set
+            # of that reg's gens
+            used_gens = {}
+            for r, r_gen in bb.r_use:
+                used_gens.setdefault(r, set()).add(r_gen)
+            # figure out which registers have multiple available generations
+            for r, r_used_gens in used_gens.items():
+                if len(r_used_gens) == 1:
+                    # if only one generation is available, no need to replace it
                     continue
-                # but if there's more than one, we have to.
-                # figure out if any of our generations has already been merged
-                for r_gen in r_gens:
-                    merge_gen = gen_map.get((r, r_gen))
-                    if merge_gen is not None:
-                        # one was, so merge to that one
-                        merge_gen = merge_gen[1]
+                # but if there's more than one, we have to. figure out if any of
+                # the generations already has a replacement.
+                for r_gen in r_used_gens:
+                    replace_gen = gen_map.get((r, r_gen))
+                    if replace_gen is not None:
+                        # this one does. use its replacement for the others too.
+                        replace_gen = replace_gen[1]
                         break
                 else:
-                    # it wasn't, so create a new generation to merge to
-                    merge_gen = gens.get(r, 1)
-                    gens[r] = merge_gen+1
-                # now we can mark that all these generations get merged
-                for r_gen in r_gens:
-                    gen_map[(r, r_gen)] = (r, merge_gen)
-        # now that we know where each generation needs to go, apply the map to
-        # the whole structure
-        def merge(regs):
+                    # it doesn't, so create a new replacement generation
+                    replace_gen = gens.get(r, 1)
+                    gens[r] = replace_gen+1
+                # we say that all the generations this BB uses get replaced by
+                # the one selected above
+                for r_gen in r_used_gens:
+                    gen_map[(r, r_gen)] = (r, replace_gen)
+        # now that we know what each generation is replaced by, apply that
+        # knowledge to replace generations across the whole structure
+        def replace(regs):
+            # look up what each (reg, gen) is replaced by, or leave it alone if
+            # we don't have a replacement
             return frozenset(
                 gen_map.get((r, r_gen), (r, r_gen)) for r, r_gen in regs)
         for bb_ident, bb in bbs.items():
             insns = []
             bbs[bb_ident] = bb._replace(
-                r_in=merge(bb.r_in),
-                r_out=merge(bb.r_out),
-                insns=tuple(insn._replace(r_in=merge(insn.r_in),
-                    r_out=merge(insn.r_out)) for insn in bb.insns)
+                r_use=replace(bb.r_use),
+                r_def=replace(bb.r_def),
+                insns=tuple(insn._replace(r_use=replace(insn.r_use),
+                    r_def=replace(insn.r_def)) for insn in bb.insns)
             )
 
         # at this point, each (reg, gen) tuple is a unique register in the
-        # program that must not overlap with any other
+        # program such that it represents one virtual register that can't be
+        # assigned the same physical register as another virtual register with
+        # an overlapping lifetime.
 
         return bbs
 
@@ -357,7 +376,7 @@ class RegisterAllocator:
         for bb_ident, bb in bbs.items():
             # create a node for each basic block with its input and output regs
             # inside
-            regs = "R_IN: {}\nR_OUT: {}".format(bb.r_in, bb.r_out)
+            regs = "R_USE: {}\nR_DEF: {}".format(bb.r_use, bb.r_def)
             dot.node(str(bb_ident), regs, shape="box", xlabel=str(bb_ident),
                 forcelabels="true")
         for bb_ident, bb in bbs.items():
@@ -367,7 +386,7 @@ class RegisterAllocator:
         dot.render("/tmp/blah2", view=True)
 
 
-# assign each property a unique number so we know where a variable is used
+# assign each property a unique number so we know where a register is used
 class RegisterTracker:
     def __init__(self):
         # initialize with machine registers
@@ -385,9 +404,9 @@ class RegisterTracker:
 # decoded boneless instruction
 _i_fields = [
     # OTHER PEOPLE'S PROPERTIES
-    "r_in",    # frozenset of register numbers used by this insn
-    "r_out",   # r_out: frozenset of register numbers defined by ths insn
-    "targets", # targets: frozenset of possible control flow targets.
+    "r_use",   # frozenset of register numbers used by this insn
+    "r_def",   # frozenset of register numbers defined by ths insn
+    "targets", # frozenset of possible control flow targets:
                #     None = next instruction
                #     str = label with that name
                #     int = register with that number
@@ -410,8 +429,8 @@ class Insn(namedtuple("Insn", _i_fields)):
         # hack for R_USE cause it's not a boneless instr
         if isinstance(instr, R_USE):
             return super(Insn, cls).__new__(cls,
-                r_in=frozenset((instr.rsd,)),
-                r_out=frozenset(),
+                r_use=frozenset((instr.rsd,)),
+                r_def=frozenset(),
                 targets=frozenset((None,)),
                 instr_type=R_USE,
                 instr_fields={"rsd": instr.rsd},
@@ -436,8 +455,8 @@ class Insn(namedtuple("Insn", _i_fields)):
             instr_base_type = instr_base_type.__bases__[0]
 
         # default flow properties
-        r_in = set()
-        r_out = set()
+        r_use = set()
+        r_def = set()
         targets = {None}
         
         # third, figure out what exactly that type means
@@ -461,13 +480,13 @@ class Insn(namedtuple("Insn", _i_fields)):
                 raise ValueError(
                     "JR offset must be 0, which '{}' is not".format(dest))
             # we depend on the jump target register
-            r_in = {instr_fields["rsd"]}
+            r_use = {instr_fields["rsd"]}
             # and that's where we go always
             targets = {instr_fields["rsd"]}
         elif instr_base_type is JRAL:
             # jump to register and save next pc in register
-            r_in = {instr_fields["rb"]}
-            r_out = {instr_fields["rsd"]}
+            r_use = {instr_fields["rb"]}
+            r_def = {instr_fields["rsd"]}
             # for subroutine calls, we assume the call will eventually return
             # back to where it started. if we didn't have to allocate registers
             # for the target (e.g. it was a different procedure) then the user
@@ -477,7 +496,7 @@ class Insn(namedtuple("Insn", _i_fields)):
             raise ValueError("can't yet allocate JVT or JST")
         elif instr_base_type is JAL:
             # jump to target and save next pc in register
-            r_out = {instr_fields["rsd"]}
+            r_def = {instr_fields["rsd"]}
             if not isinstance(instr_fields["imm"], str):
                 raise ValueError(
                     "JAL target must be str, which '{}' is not".format(dest))
@@ -491,22 +510,22 @@ class Insn(namedtuple("Insn", _i_fields)):
             # just a generic instruction with whatever function.
             # ra and rb are always inputs.
             ra = instr_fields.get("ra")
-            if ra is not None: r_in.add(ra)
+            if ra is not None: r_use.add(ra)
             rb = instr_fields.get("rb")
-            if rb is not None: r_in.add(rb)
+            if rb is not None: r_use.add(rb)
             rsd = instr_fields.get("rsd")
             if rsd is not None:
                 if instr_base_type in Insn.INSTRS_RSD_SOURCE:
                     # rsd might be an input too for a few rare instructions
-                    r_in.add(rsd)
+                    r_use.add(rsd)
                 else:
                     # but it's usually an output
-                    r_out = {instr_fields["rsd"]}
+                    r_def = {instr_fields["rsd"]}
 
         # freeze everything and return the data
         return super(Insn, cls).__new__(cls,
-            r_in=frozenset(r_in),
-            r_out=frozenset(r_out),
+            r_use=frozenset(r_use),
+            r_def=frozenset(r_def),
             targets=frozenset(targets),
             instr_type=instr_type,
             instr_fields=instr_fields,
@@ -519,9 +538,10 @@ class Insn(namedtuple("Insn", _i_fields)):
             # get instruction name from its class
             "type={}".format(str(self.instr_type).split(".")[-1][:-2]),
             # convert frozensets to sets to avoid displaying frozenset()
-            (", r_in={}".format(set(self.r_in))) if len(self.r_in) > 0 else "",
-            (", r_out={}".format(set(self.r_out)))
-                if len(self.r_out) > 0 else "",
+            (", r_use={}".format(set(self.r_use)))
+                if len(self.r_use) > 0 else "",
+            (", r_def={}".format(set(self.r_def)))
+                if len(self.r_def) > 0 else "",
             (", targets={}".format(set(self.targets)))
                 if len(self.targets) > 1 or None not in self.targets else "",
             ")",
@@ -530,11 +550,10 @@ class Insn(namedtuple("Insn", _i_fields)):
 
 del _i_fields # avoid cluttering namespace
 
-# basic block type
 BasicBlock = namedtuple("BasicBlock", [
     "insns", # tuple of instructions in this basic block
-    "r_in", # frozenset of registers used by this basic block
-    "r_out", # frozenset of registers defined by this basic block
+    "r_use", # frozenset of registers used by this basic block
+    "r_def", # frozenset of registers defined by this basic block
     "sources", # frozenset of basic blocks that may jump to us
     "targets", # frozenset of basic blocks that we may jump to
 ])
