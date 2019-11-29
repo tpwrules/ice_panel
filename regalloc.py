@@ -19,6 +19,8 @@ from boneless.arch.opcode import Instr
 from boneless.arch.opcode import *
 Label = L
 
+from collections import namedtuple
+
 __all__ = ["RegisterAllocator", "R_USE"]
 
 # special pseudo-instruction to force a register use
@@ -26,7 +28,7 @@ class R_USE:
     def __init__(self, rsd):
         self.rsd = rsd
 
-# the register allocate itself. instantiate one, then reference arbitrary
+# the register allocator itself. instantiate one, then reference arbitrary
 # registers in your code as attributes of the tracker. then add code with
 # add_code, and finally return allocated code with allocate.
 class RegisterAllocator:
@@ -57,86 +59,95 @@ class RegisterAllocator:
 
     def allocate(self):
         # step 1: find basic blocks
-        bb = self._to_basic_blocks()
-        self._bb_render(bb)
+        bb = RegisterAllocator._make_basic_blocks(self.code)
+        RegisterAllocator._bb_render(bb)
         return bb
 
-    # turn our code into a graph of basic blocks
-    def _to_basic_blocks(self):
-        # we name basic blocks with the integer number of the instruction
-        # where they start.
-        bbs = {} # all of the ones we've found
-        bb_starts = {0} # set of places we might find to start a basic block
+    # turn some code into a graph of basic blocks
+    @classmethod
+    def _make_basic_blocks(cls, code_in):
+        # a basic block's (BB) identifier is its integer index into the code.
+        bbs = {} # dict from identifiers to the BB objects
+        bb_starts = {0} # set of code inindices that might start a BB
 
-        # remove all the labels from the instructions and add their location
-        # to the basic block candidate list.
-        code = [] # instructions minus labels
-        label_locs = {} # instruction location of each label
-        insn_ptr = 0
-        for insn in self.code:
-            if isinstance(insn, Label):
-                label_locs[insn.name] = insn_ptr
-                bb_starts.add(insn_ptr)
-            else:
-                code.append(insn)
-                insn_ptr += 1
+        # labels always start a BB. they're also not real instructions. remove
+        # all the labels from the instructions and add their location to the BB
+        # candidate list.
+        code = [] # the code, without labels. insn references index this.
+        label_indices = {} # dict of label names to index of their first insn
+        insn_idx = 0 # the number of the instruction that we're looking at
+        for insn in code_in:
+            if isinstance(insn, Label): # is this "instruction" a label?
+                label_indices[insn.name] = insn_idx # remember where it starts
+                bb_starts.add(insn_idx) # and queue it for BB search
+            else: # it's just an instruction
+                code.append(insn) # keep it
+                insn_idx += 1 # advance insn index since we've added another
 
-        # search through all the starts and see if we can make a basic block
+        # make a BB from each instruction that starts one
         while len(bb_starts) > 0:
             bb_start = bb_starts.pop()
-            if bb_start in bbs:
-                continue # probably going to happen. just ignore it.
+            if bb_start in bbs: # is this already the start of a BB?
+                continue # no need to process it again
 
-            insn_ptr = bb_start
-            insns = [] # instructions in this basic block
-            targets = [] # where this basic block goes
+            insn_idx = bb_start
+            insns = [] # instructions in this BB
+            targets = set() # identifiers of BBs this one may jump to
             while True:
-                # are we bumping into another basic block?
-                if insn_ptr in bb_starts or insn_ptr in bbs:
-                    # yes, end this one
-                    targets = [insn_ptr]
+                # are we bumping into another BB?
+                if insn_idx in bb_starts or insn_idx in bbs:
+                    # yes, end this one.
+                    targets = {insn_idx} # it has to fall through to the bumpee
                     break
-                try:
-                    insn = code[insn_ptr]
-                except IndexError:
-                    # end of code (and thus basic block)
+                if insn_idx == len(code): # finished with the instructions?
+                    # this BB has to end. it doesn't have any targets.
                     break
-                # this instruction is always in this basic block
+                insn = code[insn_idx]
+                # this instruction is always in this BB
                 insns.append(insn)
-                # but where does this one go?
-                if len(insn.targets) != 1 or insn.targets[0] is not None:
+                # but where does it go?
+                if len(insn.targets) != 1 or None not in insn.targets:
                     # somewhere exciting!
                     for target in insn.targets:
                         if isinstance(target, int):
                             # a register. we can't understand that yet.
                             raise Exception("target reg is bad")
                         elif isinstance(target, str):
-                            # a label. convert it to the pointer number.
-                            targets.append(label_locs[target])
+                            # a label. convert the name to a code index.
+                            targets.add(label_indices[target])
                         elif target is None:
-                            # it just goes to the next instruction
-                            targets.append(insn_ptr+1)
-                    break # a change of flow ends the basic block
-                insn_ptr += 1
+                            # it just goes to the next instruction.
+                            targets.add(insn_idx+1)
+                    break # a change of flow must end the BB
+                insn_idx += 1
 
-            # remember the basic block
-            bbs[bb_start] = (insns, targets)
-            # anywhere this one goes might be another
-            bb_starts.update(targets)
+            bb = BasicBlock(
+                insns=insns, targets=targets,
+                # we calculate these later
+                r_in=set(), r_out=set(), sources=set(),
+            )
+            bbs[bb_start] = bb
+
+            # any code index that this BB targets must be another BB.
+            bb_starts |= targets
+
+        # from this point on, the instruction indices are meaningless. the basic
+        # block identifier is now just an opaque number.
 
         return bbs
 
-    def _bb_render(self, bbs):
+    @classmethod
+    def _bb_render(cls, bbs):
         from graphviz import Digraph
         dot = Digraph()
-        for bb_name, bb in bbs.items():
+        for bb_ident, bb in bbs.items():
             # create a node for each basic block with its code inside
-            cstr = "\n".join(str(insn) for insn in bb[0])
-            dot.node(str(bb_name), cstr, shape="box")
-        for bb_name, bb in bbs.items():
+            code = "\n".join(str(insn) for insn in bb.insns)
+            dot.node(str(bb_ident), code, shape="box")
+        for bb_ident, bb in bbs.items():
             # then connect all the nodes
-            for target in bb[1]:
-                dot.edge(str(bb_name), str(target))
+            for target in bb.targets:
+                dot.edge(str(bb_ident), str(target))
         dot.render("/tmp/blah", view=True)
 
 
@@ -166,9 +177,9 @@ class Insn:
     def __init__(self, instr):
         # what we should init:
         # OTHER PEOPLE'S PROPERTIES
-        # r_in: tuple of register numbers used by this insn
-        # r_out: tuple of register numbers defined by ths insn
-        # targets: tuple of possible control flow targets.
+        # r_in: set of register numbers used by this insn
+        # r_out: set of register numbers defined by ths insn
+        # targets: set of possible control flow targets.
         #         None = next instruction
         #         str = label with that name
         #         int = register with that number
@@ -185,9 +196,9 @@ class Insn:
         if isinstance(instr, R_USE):
             self.instr_type = R_USE
             self.instr_fields = {"rsd": instr.rsd}
-            self.r_in = (instr.rsd,)
-            self.r_out = ()
-            self.targets = (None,)
+            self.r_in = {instr.rsd}
+            self.r_out = set()
+            self.targets = {None}
             return
 
         # first, take apart the instr into its component parts
@@ -206,13 +217,13 @@ class Insn:
         # second, un-alias the instruction so we have a common type
         instr_type = type(instr)
         while instr_type.alias is True:
-            # the only subclass of an alias is the original instruction class
+            # the only superclass of an alias is the original instruction class
             instr_type = instr_type.__bases__[0]
 
         # default flow properties
-        self.r_in = ()
-        self.r_out = ()
-        self.targets = (None,)
+        self.r_in = set()
+        self.r_out = set()
+        self.targets = {None}
         
         # third, figure out what exactly that type means
         if instr_type in Insn.INSTRS_BRANCH:
@@ -221,65 +232,73 @@ class Insn:
                 raise ValueError(
                     "branch target must be str, which '{}' is not".format(dest))
             # target is the next instruction or the branch's destination
-            self.targets = (None, dest)
+            self.targets = {None, dest}
         elif instr_type is J:
             # unconditional jump, no registers, and target is label
             dest = instr_fields["imm"]
             if not isinstance(dest, str):
                 raise ValueError(
                     "jump target must be str, which '{}' is not".format(dest))
-            self.targets = (dest,)
+            self.targets = {dest}
         elif instr_type is JR:
             # register-based jump
             if instr_fields["imm"] != 0:
                 raise ValueError(
                     "JR offset must be 0, which '{}' is not".format(dest))
             # we depend on the jump target register
-            self.r_in = (instr_fields["rsd"],)
+            self.r_in = {instr_fields["rsd"]}
             # and that's where we go always
-            self.targets = (instr_fields["rsd"],)
+            self.targets = {instr_fields["rsd"]}
         elif instr_type is JRAL:
             # jump to register and save next pc in register
-            self.r_in = (instr_fields["rb"],)
-            self.r_out = (instr_fields["rsd"],)
+            self.r_in = {instr_fields["rb"]}
+            self.r_out = {instr_fields["rsd"]}
             # for subroutine calls, we assume the call will eventually return
             # back to where it started. if we didn't have to allocate registers
             # for the target (e.g. it was a different procedure) then the user
             # would write that differently.
-            self.targets = (instr_fields["rb"], None)
+            self.targets = {instr_fields["rb"], None}
         elif instr_type is JVT or instr_type is JST:
             raise ValueError("can't yet allocate JVT or JST")
         elif instr_type is JAL:
             # jump to target and save next pc in register
-            self.r_out = (instr_fields["rsd"],)
+            self.r_out = {instr_fields["rsd"]}
             if not isinstance(instr_fields["imm"], str):
                 raise ValueError(
                     "JAL target must be str, which '{}' is not".format(dest))
             # see commentary in JRAL
-            self.targets = (instr_fields["imm"], None)
+            self.targets = {instr_fields["imm"], None}
         elif instr_type is NOP:
             # encoded as conditional jump, but it doesn't depend on anything.
             # the default is fine.
             pass
         else:
             # just a generic instruction with whatever function
-            ir = [
-                # ra and rb are always inputs
-                instr_fields.get("ra"),
-                instr_fields.get("rb"),
-            ]
-            # rsd might be for a few rare instructions
-            if instr_type in Insn.INSTRS_SOURCE:
-                ir.append(instr_fields.get("rsd"))
-            self.r_in = tuple(r for r in ir if r is not None)
+
+            # ra and rb are always inputs
+            ra = instr_fields.get("ra")
+            if ra is not None: self.r_in.add(ra)
+            rb = instr_fields.get("rb")
+            if rb is not None: self.r_in.add(rb)
+            # rsd might be an input too for a few rare instructions
+            rsd = instr_fields.get("rsd")
+            if instr_type in Insn.INSTRS_SOURCE and rsd is not None:
+                self.r_in.add(rsd)
+
             # but rsd is probably an output
-            if instr_type not in Insn.INSTRS_SOURCE:
-                try:
-                    self.r_out = (instr_fields["rsd"],)
-                except KeyError:
-                    pass
+            if instr_type not in Insn.INSTRS_SOURCE and rsd is not None:
+                self.r_out = {instr_fields["rsd"]}
             
     def __repr__(self):
         return("Insn(type={}, r_in={}, r_out={}, targets={})".format(
             str(self.instr_type).split(".")[-1][:-2], # sorry
             self.r_in, self.r_out, self.targets))
+
+# basic block type
+BasicBlock = namedtuple("BasicBlock", [
+    "insns", # list of instructions in this basic block
+    "r_in", # set of registers used by this basic block
+    "r_out", # set of registers defined by this basic block
+    "sources", # set of basic blocks that may jump to us
+    "targets", # set of basic blocks that we may jump to
+])
