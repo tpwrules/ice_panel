@@ -278,6 +278,60 @@ class RegisterAllocator:
             bbs[bb_ident] = bb._replace(
                 r_in=r_in, insns=tuple(insns_genned[::-1]))
 
+        # once the above is done, we've left a lot of garbage generations as BB
+        # inputs. the only way for a generation of a register to be a BB input
+        # is if it's used in that BB before (and if) the register is written.
+        # thus, having multiple generations of a register as input means they
+        # MUST be merged to the same generation so that the register refers to
+        # the same value no matter which generation actually reaches the BB.
+
+        # by the way, this means it's definitely not in SSA anymore
+
+        # dict from (reg, gen) to (reg, merged_gen)
+        gen_map = {}
+        # first we go through and figure out which generations need to be
+        # merged, and to what
+        for bb in bbs.values():
+            # sort tuples into dict of reg to set of gens
+            in_gens = {}
+            for r, r_gen in bb.r_in:
+                in_gens.setdefault(r, set()).add(r_gen)
+            # now we can figure out which variables have multiple gens input
+            for r, r_gens in in_gens.items():
+                if len(r_gens) == 1:
+                    # if only one generation is available, we can't merge it
+                    continue
+                # but if there's more than one, we have to.
+                # figure out if any of our generations has already been merged
+                for r_gen in r_gens:
+                    merge_gen = gen_map.get((r, r_gen))
+                    if merge_gen is not None:
+                        # one was, so merge to that one
+                        merge_gen = merge_gen[1]
+                        break
+                else:
+                    # it wasn't, so create a new generation to merge to
+                    merge_gen = gens.get(r, 1)
+                    gens[r] = merge_gen+1
+                # now we can mark that all these generations get merged
+                for r_gen in r_gens:
+                    gen_map[(r, r_gen)] = (r, merge_gen)
+        # now that we know where each generation needs to go, apply the map to
+        # the whole structure
+        def merge(regs):
+            return frozenset(
+                gen_map.get((r, r_gen), (r, r_gen)) for r, r_gen in regs)
+        for bb_ident, bb in bbs.items():
+            insns = []
+            bbs[bb_ident] = bb._replace(
+                r_in=merge(bb.r_in),
+                r_out=merge(bb.r_out),
+                insns=tuple(insn._replace(r_in=merge(insn.r_in),
+                    r_out=merge(insn.r_out)) for insn in bb.insns)
+            )
+
+        # at this point, each (reg, gen) tuple is a unique register in the
+        # program that must not overlap with any other
 
         return bbs
 
