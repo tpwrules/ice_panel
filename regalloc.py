@@ -230,6 +230,55 @@ class RegisterAllocator:
                     r_in_genned.add((r_in, r_in_gen))
             bbs[bb_ident] = bb._replace(r_in=frozenset(r_in_genned))
 
+        # we've calculated what register generations each BB uses for input and
+        # output. but the insns within still don't know. but since they are
+        # straight line code, it's simple to figure out.
+        for bb_ident, bb in bbs.items():
+            insns_genned = []
+            # the current generation that each register outputs. since we go
+            # backwards through the insns, this starts out as the generation
+            # that the BB outputs.
+            out_gen = {r: r_gen for r, r_gen in bb.r_out}
+            for insn in bb.insns[::-1]:
+                # if this insn outputs a register, it is to the current
+                # generation defined above.
+                r_out = set()
+                for r in insn.r_out:
+                    r_out.add((r, out_gen[r]))
+                    # but! now that this insn has output to it, no other insn
+                    # can (cause this is SSA). any outputs in the future have to
+                    # be to a new generation. additionally, no insns before this
+                    # one have access to this output, so all inputs have to come
+                    # from that generation too.
+                    gen = gens.get(r, 1)
+                    gens[r] = gen+1
+                    out_gen[r] = gen
+                # input registers are from the current output as above
+                r_in = set()
+                for r in insn.r_in:
+                    if r not in out_gen:
+                        # haven't seen this input yet but it must come from a
+                        # new generation
+                        gen = gens.get(r, 1)
+                        gens[r] = gen+1
+                        out_gen[r] = gen
+                    r_in.add((r, out_gen[r]))
+                insns_genned.append(
+                    insn._replace(r_in=frozenset(r_in), r_out=frozenset(r_out)))
+            # the current output generation has to be an input to this BB
+            # because we assumed it would be the input to an insn within this
+            # BB. of course, if this BB doesn't have that register as an input,
+            # then no insn will input it and we don't need to add it.
+            nums_in = set(r for r, r_gen in bb.r_in)
+            r_in = bb.r_in.union(
+                (r, r_gen) for r, r_gen in out_gen.items() if r in nums_in)
+            # there is by definition another generation of each register that's
+            # already an input to this BB, but it's okay if we have multiple;
+            # that gets fixed later.
+            bbs[bb_ident] = bb._replace(
+                r_in=r_in, insns=tuple(insns_genned[::-1]))
+
+
         return bbs
 
     @classmethod
