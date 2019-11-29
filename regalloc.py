@@ -134,6 +134,21 @@ class RegisterAllocator:
         # from this point on, the instruction indices are meaningless. the basic
         # block identifier is now just an opaque number.
 
+        # now that we know each BB and where it goes, use that information to
+        # calculate where each BB might come from.
+        for bb_ident, bb in bbs.items():
+            for target in bb.targets:
+                bbs[target].sources.add(bb_ident)
+
+        # calculate register usage for each BB as a whole
+        for bb_ident, bb in bbs.items():
+            for insn in bb.insns:
+                # regs that this instruction uses must come from outside this BB
+                # unless they are alreay defined
+                bb.r_in.update(insn.r_in - bb.r_out)
+                # regs that this instruction defines are defined within this BB
+                bb.r_out.update(insn.r_out)
+
         return bbs
 
     @classmethod

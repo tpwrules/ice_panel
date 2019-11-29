@@ -141,4 +141,6 @@ def test_2():
 
     return alloc.allocate()
 
-print(test_2()) # execute the test, who knows what will happen
+r = sorted(test_2().items())
+for bbi, bb in r:
+    print(bbi, ":   ", bb)
