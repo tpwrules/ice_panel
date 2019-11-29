@@ -59,9 +59,11 @@ class RegisterAllocator:
 
     def allocate(self):
         # step 1: find basic blocks
-        bb = RegisterAllocator._make_basic_blocks(self.code)
-        RegisterAllocator._bb_render(bb)
-        return bb
+        bbs = RegisterAllocator._make_basic_blocks(self.code)
+        bbs = RegisterAllocator._renumber_regs(bbs)
+        RegisterAllocator._bb_render_code(bbs)
+        RegisterAllocator._bb_render_in_out(bbs)
+        return bbs
 
     # turn some code into a graph of basic blocks
     @classmethod
@@ -151,19 +153,104 @@ class RegisterAllocator:
 
         return bbs
 
+    # figure out live ranges for each register
     @classmethod
-    def _bb_render(cls, bbs):
+    def _renumber_regs(cls, bbs_in):
+        # we convert the register numbers to vaguely SSA.
+        # first thing is to give each output register its own "generation".
+        # i.e. if one register is an output on two basic blocks, each register
+        # gets a different generation.
+        gens = {} # dict from register number to latest generation number
+        bbs = {} # basic blocks with renumbered output registers
+        for bb_ident, bb in bbs_in.items():
+            r_out_genned = set()
+            # replace each register number with (reg num, generation)
+            for r_out in bb.r_out:
+                gen = gens.get(r_out, 1)
+                gens[r_out] = gen+1
+                r_out_genned.add((r_out, gen))
+            bbs[bb_ident] = bb._replace(r_out=r_out_genned)
+
+        # then the second thing is to figure out which generation might be
+        # available for each input register. we do this by computing the
+        # "reachability": which generations of what regsters are available at
+        # each BB.
+
+        # dict for reachability from BB ident to set of register, generation
+        # tuples that are available to that BB.
+        reachable = {bb_ident: set() for bb_ident in bbs.keys()}
+        # dict from BB ident to set of registers that that BB redefines
+        redefined = {}
+        for bb_ident, bb in bbs.items():
+            redefined[bb_ident] = set(r_out for r_out, r_out_gen in bb.r_out)
+        changed = True # loop until we've stopped updating the dict
+        while changed:
+            changed = False
+            for bb_ident, bb in bbs.items():
+                new_reachers = set()
+                # look through all the BBs that lead to us
+                for bb_pred_ident in bb.sources:
+                    bb_pred = bbs[bb_pred_ident]
+                    # any register generations in that BB must reach us
+                    new_reachers |= bb_pred.r_out
+                    # as well as any generations that reach that BB, so long as
+                    # the BB does not redefine them into a new generation!
+                    for r_out, r_out_gen in reachable[bb_pred_ident]:
+                        if r_out not in redefined[bb_pred_ident]:
+                            new_reachers.add((r_out, r_out_gen))
+
+                if len(new_reachers - reachable[bb_ident]): # found new items?
+                    changed = True # we probably need to recalculate other BBs
+                    reachable[bb_ident] = new_reachers
+
+        # now we can figure out which generation each BB uses as input based on
+        # what's reachable to that BB
+        bbs_in = bbs # we recreate the BBs with new input register sets
+        bbs = {}
+        for bb_ident, bb in bbs_in.items():
+            r_in_genned = set()
+            # every reachable variable is a candidate for this BB. note that we
+            # add multiple generations if available; those will be resolved
+            # later. also note that this BB doesn't need to have registers as
+            # input that it doesn't actually use. its targets already know about
+            # those registers.
+            for r_in, r_in_gen in reachable[bb_ident]:
+                if r_in in bb.r_in:
+                    r_in_genned.add((r_in, r_in_gen))
+            bbs[bb_ident] = bb._replace(r_in=r_in_genned)
+
+        return bbs
+
+    @classmethod
+    def _bb_render_code(cls, bbs):
         from graphviz import Digraph
         dot = Digraph()
         for bb_ident, bb in bbs.items():
             # create a node for each basic block with its code inside
             code = "\n".join(str(insn) for insn in bb.insns)
-            dot.node(str(bb_ident), code, shape="box")
+            dot.node(str(bb_ident), code, shape="box", xlabel=str(bb_ident),
+                forcelabels="true")
         for bb_ident, bb in bbs.items():
             # then connect all the nodes
             for target in bb.targets:
                 dot.edge(str(bb_ident), str(target))
         dot.render("/tmp/blah", view=True)
+
+    @classmethod
+    def _bb_render_in_out(cls, bbs):
+        from graphviz import Digraph
+        dot = Digraph()
+        for bb_ident, bb in bbs.items():
+            # create a node for each basic block with its input and output regs
+            # inside
+            regs = "R_IN: {}\nR_OUT: {}".format(bb.r_in, bb.r_out)
+            dot.node(str(bb_ident), regs, shape="box", xlabel=str(bb_ident),
+                forcelabels="true")
+        for bb_ident, bb in bbs.items():
+            # then connect all the nodes
+            for target in bb.targets:
+                dot.edge(str(bb_ident), str(target))
+        dot.render("/tmp/blah2", view=True)
 
 
 # assign each property a unique number so we know where a variable is used
