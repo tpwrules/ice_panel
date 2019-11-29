@@ -70,7 +70,7 @@ class RegisterAllocator:
     def _make_basic_blocks(cls, code_in):
         # a basic block's (BB) identifier is its integer index into the code.
         bbs = {} # dict from identifiers to the BB objects
-        bb_starts = {0} # set of code inindices that might start a BB
+        bb_starts = {0} # set of code indices that might start a BB
 
         # labels always start a BB. they're also not real instructions. remove
         # all the labels from the instructions and add their location to the BB
@@ -146,14 +146,14 @@ class RegisterAllocator:
         for bb_ident, bb in bbs.items():
             for insn in bb.insns:
                 # regs that this instruction uses must come from outside this BB
-                # unless they are alreay defined
+                # unless they are already defined
                 bb.r_in.update(insn.r_in - bb.r_out)
                 # regs that this instruction defines are defined within this BB
                 bb.r_out.update(insn.r_out)
 
         return bbs
 
-    # figure out live ranges for each register
+    # uniquely number each definition of each register and its usages
     @classmethod
     def _renumber_regs(cls, bbs_in):
         # we convert the register numbers to vaguely SSA.
@@ -274,7 +274,7 @@ class Insn:
     INSTRS_BRANCH = {BZ1, BZ0, BS1, BS0, BC1, BC0, BV1, BV0,
         BGTS, BGTU, BGES, BLES, BLEU, BLTS}
     # instructions where rsd is a source
-    INSTRS_SOURCE = {ST, STR, STX, STXA}
+    INSTRS_RSD_SOURCE = {ST, STR, STX, STXA}
 
     def __init__(self, instr):
         # what we should init:
@@ -334,7 +334,7 @@ class Insn:
                 raise ValueError(
                     "branch target must be str, which '{}' is not".format(dest))
             # target is the next instruction or the branch's destination
-            self.targets = {None, dest}
+            self.targets = {dest, None}
         elif instr_type is J:
             # unconditional jump, no registers, and target is label
             dest = instr_fields["imm"]
@@ -375,26 +375,34 @@ class Insn:
             # the default is fine.
             pass
         else:
-            # just a generic instruction with whatever function
-
-            # ra and rb are always inputs
+            # just a generic instruction with whatever function.
+            # ra and rb are always inputs.
             ra = instr_fields.get("ra")
             if ra is not None: self.r_in.add(ra)
             rb = instr_fields.get("rb")
             if rb is not None: self.r_in.add(rb)
-            # rsd might be an input too for a few rare instructions
             rsd = instr_fields.get("rsd")
-            if instr_type in Insn.INSTRS_SOURCE and rsd is not None:
-                self.r_in.add(rsd)
-
-            # but rsd is probably an output
-            if instr_type not in Insn.INSTRS_SOURCE and rsd is not None:
-                self.r_out = {instr_fields["rsd"]}
+            if rsd is not None:
+                if instr_type in Insn.INSTRS_RSD_SOURCE:
+                    # rsd might be an input too for a few rare instructions
+                    self.r_in.add(rsd)
+                else:
+                    # but it's usually an output
+                    self.r_out = {instr_fields["rsd"]}
             
     def __repr__(self):
-        return("Insn(type={}, r_in={}, r_out={}, targets={})".format(
-            str(self.instr_type).split(".")[-1][:-2], # sorry
-            self.r_in, self.r_out, self.targets))
+        # only include parts that actually exist to shorten representation
+        s = [
+            "Insn(",
+            # get instruction name from its class
+            "type={}".format(str(self.instr_type).split(".")[-1][:-2]),
+            (", r_in={}".format(self.r_in)) if len(self.r_in) > 0 else "",
+            (", r_out={}".format(self.r_out)) if len(self.r_out) > 0 else "",
+            (", targets={}".format(self.targets))
+                if len(self.targets) > 1 or None not in self.targets else "",
+            ")",
+        ]
+        return "".join(s)
 
 # basic block type
 BasicBlock = namedtuple("BasicBlock", [
