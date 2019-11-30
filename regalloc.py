@@ -463,40 +463,57 @@ class RegisterAllocator:
         live_ranges = {r: set() for r in all_regs}
         for bb_ident, bb in bbs.items():
             # since this is straight line code, we can easily figure out the
-            # liveness of its registers. a register is live from the instruction
-            # after its first definition to the instruction of its last use.
+            # liveness of its registers. a particular definition of a register
+            # is live from the instruction after that definition to the
+            # instruction of that definition's last use. because this isn't SSA,
+            # we can't just go from first definition to last use.
 
-            # dict from register to insn idx of first definition. registers live
-            # into this BB were effectively defined before the first insn.
-            def_insns = {r: -1 for r in bb_in[bb_ident]}
-            # dict from register to insn idx of last use. registers live out of
-            # this bb are effectively used after the last insn.
-            use_insns = {r: len(bb.insns) for r in bb_out[bb_ident]}
+            # dict of register to point of its current definition. registers
+            # live into this BB were effectively defined before the first insn.
+            curr_defs = {r: -1 for r in bb_in[bb_ident]}
+            # dict of register to point of its last use. if it's never used, it
+            # won't be in here.
+            curr_uses = {}
+            # list of (reg, def, use) of reg defs there aren't any more uses of
+            finished_defs = []
 
             for insn_idx, insn in enumerate(bb.insns):
-                for r in insn.r_def:
-                    # say that this register is defined at this index, as long
-                    # as the register isn't already in the dict
-                    def_insns.setdefault(r, insn_idx)
                 for r in insn.r_use:
-                    # is this use later than the use already in the dict?
-                    if insn_idx > use_insns.get(r, -1):
-                        # yes, update with our index
-                        use_insns[r] = insn_idx
+                    # because this is a later insn than any before, this must be
+                    # the latest use of this def
+                    curr_uses[r] = insn_idx
+                for r in insn.r_def:
+                    # say that this register is defined at this index
+                    if r in curr_defs:
+                        # if it was already defined, that definition can't be
+                        # used anymore. move it to finished.
+                        finished_defs.append(
+                            (r, curr_defs.pop(r), curr_uses.pop(r, None)))
+                    curr_defs[r] = insn_idx
 
-            # each register is live from the insn idx after its definition
-            # through the insn idx of its last use.
-            for r in def_insns.keys():
-                # if insn n defines a register, it's live for insn n+1
-                def_idx = def_insns[r]+1
+            # registers live out of this BB are effectively used after the last
+            # insn.
+            for r in bb_out[bb_ident]:
+                # because this is after the insns, this must be the latest use
+                curr_uses[r] = len(bb.insns)
+            # we're finished with all the defs now
+            for r in curr_defs.keys():
+                finished_defs.append((r, curr_defs[r], curr_uses.get(r)))
+
+            # each register definition is live from the insn idx after its
+            # definition through the insn idx of its last use.
+            for r, def_idx, use_idx in finished_defs:
+                # if insn n defines a register, it's live starting from insn n+1
+                def_idx += 1
                 # but if insn is the last user of a register, it's dead after.
-                # some registers aren't used cause they're trash outputs. those
-                # we say are used only by the insn after the one that created
-                # them. they have to be alive at least one insn so that they get
-                # allocated.
-                use_idx = use_insns.get(r, def_idx)
+                # some registers aren't ever used cause they're trash outputs.
+                # those we say are used only by the insn after the one that
+                # created them. they have to be alive at least one insn so that
+                # they get allocated.
+                if use_idx is None:
+                    use_idx = def_idx
                 live_ranges[r].update(
-                    ((bb_ident, idx) for idx in range(def_idx, use_idx+1)))
+                    (bb_ident, idx) for idx in range(def_idx, use_idx+1))
 
         # we know precisely when a register is live, so we can now figure out
         # which others might interfere with it. this is currently probably

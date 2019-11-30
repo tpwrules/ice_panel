@@ -12,9 +12,10 @@ def test_1():
     r = alloc.tracker
     alloc.add_code([
         MOVI(r.a, 0),
+        MOVI(r.c, 0),
     L("loop"),
-        [ADDI(r.b, r.a, 1),
-        [ADD(r.c, r.c, r.b)],],
+        ADDI(r.b, r.a, 1),
+        ADD(r.c, r.c, r.b),
         SLLI(r.a, r.b, 1),
         CMPI(r.a, 9),
         BLTU("loop"),
