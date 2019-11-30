@@ -89,6 +89,10 @@ class RegisterAllocator:
     def _make_basic_blocks(cls, code_in):
         # a basic block's (BB) identifier is its integer index into the code.
         bbs = {} # dict from identifiers to the BB objects
+        # start with a dummy BB that just goes to the first instruction. it will
+        # help us catch errors later.
+        bbs[-1] = BasicBlock(insns=(), sources=set(), targets={0},
+            r_use=set(), r_def=set(), label=None)
         bb_starts = {0} # set of code indices that might start a BB
 
         # labels always start a BB. they're also not real instructions. remove
@@ -251,13 +255,23 @@ class RegisterAllocator:
         # reachable to that BB
         for bb_ident, bb in bbs.items():
             r_use_genned = set()
+            rs_with_gen = set()
             # we mark as used every generation of every register used by this
             # BB. note that we use multiple generations if available; those will
             # be merged later. we don't remember generations for registers this
             # BB doesn't use; its targets will remember if necessary.
             for r_use, r_use_gen in reachable[bb_ident]:
                 if r_use in bb.r_use:
+                    rs_with_gen.add(r_use)
                     r_use_genned.add((r_use, r_use_gen))
+            # if the programmer was bad and used a register before it was
+            # defined, that register will be used by this BB but have no
+            # generation that reaches it. check to make sure we got a generation
+            # for every register the BB uses.
+            bad_regs = bb.r_use - rs_with_gen
+            if len(bad_regs) > 0:
+                raise Exception("registers {} were used before "
+                    "they were defined".format(bad_regs))
             bbs[bb_ident] = bb._replace(r_use=frozenset(r_use_genned))
 
         # we've calculated what register generations each BB uses and defines,
@@ -419,6 +433,17 @@ class RegisterAllocator:
 
         # show off our hard work
         RegisterAllocator._bb_render_in_out(bbs, bb_in, bb_out)
+
+        # we need to check if any registers are live out of the dummy BB we
+        # added at the beginning. this is impossible because there are no
+        # instructions in or before it. this will happen if the programmer uses
+        # a register before it's defined, but defines it after, and there's a
+        # loop connecting the two. the register gets carried around the loop,
+        # but its initial value must come from somewhere, and that propagates to
+        # our dummy BB.
+        if len(bb_out[-1]) > 0:
+            raise Exception("registers {} were used before they were "
+                "defined".format(set(r for r, r_gen in bb_out[-1])))
 
         # now that we know which registers we need to be concerned with in each
         # basic block, we have to extend that knowledge to the individual
