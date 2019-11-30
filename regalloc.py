@@ -55,10 +55,9 @@ class RegisterAllocator:
             if isinstance(instr, Label):
                 self.code.append(instr)
             else:
-                self.code.append(Insn(instr))
+                self.code.append(Insn(instr, len(self.code)))
 
     def allocate(self):
-        # step 1: find basic blocks
         bbs = RegisterAllocator._make_basic_blocks(self.code)
         bbs = RegisterAllocator._renumber_regs(bbs)
         interferences = RegisterAllocator._calculate_interferences(bbs)
@@ -66,9 +65,19 @@ class RegisterAllocator:
             RegisterAllocator._color_interferences(interferences)
         if len(uncolorable) > 0:
             raise Exception("failed to color", uncolorable)
+
         RegisterAllocator._bb_render_code(bbs)
         RegisterAllocator._bb_render_interferences(interferences, colors)
-        return bbs
+
+        # duplicate stored code so we can replace the insns with the allocated
+        # Instrs
+        code_out = self.code.copy()
+        # now find all the insns and allocate them
+        for bb in bbs.values():
+            for insn in bb.insns:
+                code_out[insn.code_idx] = insn.allocate(colors)
+
+        return code_out
 
     # turn some code into a graph of basic blocks
     @classmethod
@@ -626,6 +635,7 @@ _i_fields = [
     "instr_type",   # type object of the instr that made this insn
     "instr_fields", # dict mapping insn field names to register numbers (rN)
                     #     or values (imm)
+    "code_idx",     # index of the original code array that this insn came from
 ]
 class Insn(namedtuple("Insn", _i_fields)):
     # instructions that branch to a label (not including aliases)
@@ -634,7 +644,7 @@ class Insn(namedtuple("Insn", _i_fields)):
     # instructions where rsd is a source
     INSTRS_RSD_SOURCE = {ST, STR, STX, STXA}
 
-    def __new__(cls, instr):
+    def __new__(cls, instr, code_idx):
         # hack for R_USE cause it's not a boneless instr
         if isinstance(instr, R_USE):
             return super(Insn, cls).__new__(cls,
@@ -643,6 +653,7 @@ class Insn(namedtuple("Insn", _i_fields)):
                 targets=frozenset((None,)),
                 instr_type=R_USE,
                 instr_fields={"rsd": instr.rsd},
+                code_idx=code_idx,
             )
 
         # first, take apart the instr into its component parts
@@ -738,6 +749,7 @@ class Insn(namedtuple("Insn", _i_fields)):
             targets=frozenset(targets),
             instr_type=instr_type,
             instr_fields=instr_fields,
+            code_idx=code_idx,
         )
             
     def __repr__(self):
@@ -756,6 +768,26 @@ class Insn(namedtuple("Insn", _i_fields)):
             ")",
         ]
         return "".join(s)
+
+    # generate an Instr that's this insn with the registers allocated to the
+    # given colors
+    def allocate(self, colors):
+        # map used and defined register generations to colors
+        c_use = {r: colors[(r, r_gen)] for r, r_gen in self.r_use}
+        c_def = {r: colors[(r, r_gen)] for r, r_gen in self.r_def}
+        # map the Instr parameters to the colors
+        p = self.instr_fields.copy()
+        if "ra" in p:
+            p["ra"] = c_use[p["ra"]]
+        if "rb" in p:
+            p["rb"] = c_use[p["rb"]]
+        if "rsd" in p:
+            if self.instr_type in Insn.INSTRS_RSD_SOURCE:
+                p["rsd"] = c_use[p["rsd"]]
+            else:
+                p["rsd"] = c_def[p["rsd"]]
+        # any imm doesn't need to be mapped
+        return self.instr_type(**p)
 
 del _i_fields # avoid cluttering namespace
 
