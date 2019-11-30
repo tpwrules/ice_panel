@@ -141,6 +141,4 @@ def test_2():
 
     return alloc.allocate()
 
-r = sorted(test_2().items())
-for bbi, bb in r:
-    print(bbi, ":   ", bb)
+test_2()

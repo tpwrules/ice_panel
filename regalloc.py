@@ -61,9 +61,9 @@ class RegisterAllocator:
         # step 1: find basic blocks
         bbs = RegisterAllocator._make_basic_blocks(self.code)
         bbs = RegisterAllocator._renumber_regs(bbs)
-        bbs = RegisterAllocator._calculate_interference(bbs)
+        interferences = RegisterAllocator._calculate_interferences(bbs)
         RegisterAllocator._bb_render_code(bbs)
-        #RegisterAllocator._bb_render_use_def(bbs)
+        RegisterAllocator._bb_render_interferences(interferences)
         return bbs
 
     # turn some code into a graph of basic blocks
@@ -357,7 +357,7 @@ class RegisterAllocator:
 
     # calculate the interference of lifetimes in a BB
     @classmethod
-    def _calculate_interference(cls, bbs):
+    def _calculate_interferences(cls, bbs):
         # first thing to do is propagate register liveness so that we know which
         # registers are live at the start (in) and end (out) of each BB.
 
@@ -395,7 +395,77 @@ class RegisterAllocator:
         # show off our hard work
         RegisterAllocator._bb_render_in_out(bbs, bb_in, bb_out)
 
-        return bbs
+        # now that we know which registers we need to be concerned with in each
+        # basic block, we have to extend that knowledge to the individual
+        # instructions the live ranges of each register.
+
+        # figure out what all the registers actually are
+        all_regs = set()
+        for bb in bbs.values():
+            for insn in bb.insns:
+                all_regs |= insn.r_use
+                all_regs |= insn.r_def
+        all_regs = frozenset(all_regs)
+
+        # dict from register to set of (bb ident, insn idx) of instructions that
+        # the register will be live for. insn idx can be len(insn) for registers
+        # that are live after the last insn.
+        live_ranges = {r: set() for r in all_regs}
+        for bb_ident, bb in bbs.items():
+            # since this is straight line code, we can easily figure out the
+            # liveness of its registers. a register is live from the instruction
+            # after its first definition to the instruction of its last use.
+
+            # dict from register to insn idx of first definition. registers live
+            # into this BB were effectively defined before the first insn.
+            def_insns = {r: -1 for r in bb_in[bb_ident]}
+            # dict from register to insn idx of last use. registers live out of
+            # this bb are effectively used after the last insn.
+            use_insns = {r: len(bb.insns) for r in bb_out[bb_ident]}
+
+            for insn_idx, insn in enumerate(bb.insns):
+                for r in insn.r_def:
+                    # say that this register is defined at this index, as long
+                    # as the register isn't already in the dict
+                    def_insns.setdefault(r, insn_idx)
+                for r in insn.r_use:
+                    # is this use later than the use already in the dict?
+                    if insn_idx > use_insns.get(r, -1):
+                        # yes, update with our index
+                        use_insns[r] = insn_idx
+
+            # each register is live from the insn idx after its definition
+            # through the insn idx of its last use.
+            for r in def_insns.keys():
+                # if insn n defines a register, it's live for insn n+1
+                def_idx = def_insns[r]+1
+                # but if insn is the last user of a register, it's dead after.
+                # some registers aren't used cause they're trash outputs. those
+                # we say are used only by the insn after the one that created
+                # them. they have to be alive at least one insn so that they get
+                # allocated.
+                use_idx = use_insns.get(r, def_idx)
+                live_ranges[r].update(
+                    ((bb_ident, idx) for idx in range(def_idx, use_idx+1)))
+
+        # we know precisely when a register is live, so we can now figure out
+        # which others might interfere with it. this is currently probably
+        # pretty inefficient.
+
+        # dict of registers to set of registers that interfere with it
+        interferences = {}
+        for r in all_regs:
+            these_interferences = set()
+            for r_o in all_regs:
+                # don't need to say that register interferes with itself
+                if r == r_o:
+                    continue
+                if not live_ranges[r].isdisjoint(live_ranges[r_o]):
+                    # they have a live point in common -> they interfere
+                    these_interferences.add(r_o)
+            interferences[r] = frozenset(these_interferences)
+
+        return interferences
 
     @classmethod
     def _bb_render_code(cls, bbs):
@@ -443,6 +513,22 @@ class RegisterAllocator:
             for target in bb.targets:
                 dot.edge(str(bb_ident), str(target))
         dot.render("/tmp/blah3", view=True)
+
+    @classmethod
+    def _bb_render_interferences(cls, interferences):
+        from graphviz import Graph
+        dot = Graph()
+        # create a node for each register with its name inside
+        for r, interferers in interferences.items():
+            dot.node(str(r), str(r), xlabel=str(len(interferers)),
+                forcelabels="true")
+        # then connect all the nodes
+        for r, interferers in interferences.items():
+            for r_o in interferers:
+                # only create edge in one direction
+                if r <= r_o:
+                    dot.edge(str(r), str(r_o))
+        dot.render("/tmp/blah4", view=True)
 
 
 # assign each property a unique number so we know where a register is used
