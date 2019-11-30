@@ -61,8 +61,9 @@ class RegisterAllocator:
         # step 1: find basic blocks
         bbs = RegisterAllocator._make_basic_blocks(self.code)
         bbs = RegisterAllocator._renumber_regs(bbs)
+        bbs = RegisterAllocator._calculate_interference(bbs)
         RegisterAllocator._bb_render_code(bbs)
-        RegisterAllocator._bb_render_in_out(bbs)
+        #RegisterAllocator._bb_render_use_def(bbs)
         return bbs
 
     # turn some code into a graph of basic blocks
@@ -354,6 +355,48 @@ class RegisterAllocator:
 
         return bbs
 
+    # calculate the interference of lifetimes in a BB
+    @classmethod
+    def _calculate_interference(cls, bbs):
+        # first thing to do is propagate register liveness so that we know which
+        # registers are live at the start (in) and end (out) of each BB.
+
+        # dict of BB ident to sets of such
+        bb_in = {bb_ident: set() for bb_ident in bbs.keys()}
+        bb_out = {bb_ident: set() for bb_ident in bbs.keys()}
+        # we go "backward" through the dict because the information flows
+        # backward, and thus we loop less times
+        changed = True # loop until we've stopped updating reachability
+        while changed:
+            changed = False
+            for bb_ident in sorted(bbs.keys(), reverse=True):
+                bb = bbs[bb_ident]
+                # a register has to be live coming into us if we use it, or it's
+                # live going out of us and we don't define it ourselves (i.e. it
+                # must be defined outside us, so it has to go through us)
+                r_in = bb.r_use | (bb_out[bb_ident] - bb.r_def)
+                # if a register is live going into any of our targets, it has to
+                # be live coming out of us because that's where the target
+                # expects to get it from
+                r_out = frozenset().union(*(bb_in[t] for t in bb.targets))
+
+                if len(r_in - bb_in[bb_ident]): # found new live-ins?
+                    bb_in[bb_ident] = r_in
+                    # changing what's live coming into us might change what's
+                    # live going out of other BBs, so we need to recalculate
+                    changed = True
+
+                if len(r_out - bb_out[bb_ident]): # found new live-outs?
+                    bb_out[bb_ident] = r_out
+                    # changing what's live going out of us might change what's
+                    # live coming into other BBs, so we need to recalculate
+                    changed = True
+
+        # show off our hard work
+        RegisterAllocator._bb_render_in_out(bbs, bb_in, bb_out)
+
+        return bbs
+
     @classmethod
     def _bb_render_code(cls, bbs):
         from graphviz import Digraph
@@ -370,7 +413,7 @@ class RegisterAllocator:
         dot.render("/tmp/blah", view=True)
 
     @classmethod
-    def _bb_render_in_out(cls, bbs):
+    def _bb_render_use_def(cls, bbs):
         from graphviz import Digraph
         dot = Digraph()
         for bb_ident, bb in bbs.items():
@@ -384,6 +427,22 @@ class RegisterAllocator:
             for target in bb.targets:
                 dot.edge(str(bb_ident), str(target))
         dot.render("/tmp/blah2", view=True)
+
+    @classmethod
+    def _bb_render_in_out(cls, bbs, bb_in, bb_out):
+        from graphviz import Digraph
+        dot = Digraph()
+        for bb_ident, bb in bbs.items():
+            # create a node for each basic block with its regs inside
+            regs = "R_IN: {}\nR_USE: {}\nR_DEF: {}\nR_OUT: {}".format(
+                bb_in[bb_ident], bb.r_use, bb.r_def, bb_out[bb_ident])
+            dot.node(str(bb_ident), regs, shape="box", xlabel=str(bb_ident),
+                forcelabels="true")
+        for bb_ident, bb in bbs.items():
+            # then connect all the nodes
+            for target in bb.targets:
+                dot.edge(str(bb_ident), str(target))
+        dot.render("/tmp/blah3", view=True)
 
 
 # assign each property a unique number so we know where a register is used
