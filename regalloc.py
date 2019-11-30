@@ -55,7 +55,7 @@ class RegisterAllocator:
             if isinstance(instr, Label):
                 self.code.append(instr)
             else:
-                self.code.append(Insn(instr, len(self.code)))
+                self.code.append(Insn(instr))
 
     def allocate(self):
         bbs = RegisterAllocator._make_basic_blocks(self.code)
@@ -69,13 +69,18 @@ class RegisterAllocator:
         RegisterAllocator._bb_render_code(bbs)
         RegisterAllocator._bb_render_interferences(interferences, colors)
 
-        # duplicate stored code so we can replace the insns with the allocated
-        # Instrs
-        code_out = self.code.copy()
-        # now find all the insns and allocate them
-        for bb in bbs.values():
+        code_out = []
+        # reconstruct the original source, with register allocations, from our
+        # BBs. the BB ident is an index into the original code, so we process
+        # them from lowest to highest to get the original order back.
+        for bb_ident in sorted(bbs.keys()):
+            bb = bbs[bb_ident]
+            # if this BB was originally labeled in the code, put that label back
+            if bb.label is not None:
+                code_out.append(Label(bb.label))
+            # then convert all the BB's Insns back to allocated boneless Instrs
             for insn in bb.insns:
-                code_out[insn.code_idx] = insn.allocate(colors)
+                code_out.append(insn.allocate(colors))
 
         return code_out
 
@@ -99,6 +104,12 @@ class RegisterAllocator:
             else: # it's just an instruction
                 code.append(insn) # keep it
                 insn_idx += 1 # advance insn index since we've added another
+        # we also want to know the dict of BB idents to their labels so the BBs
+        # that had labels in the program know their labels here
+        bb_labels = {}
+        for label, bb_ident in label_indices.items():
+            # we can just flip around the dict of labels to BB idents
+            bb_labels[bb_ident] = label
 
         # make a BB from each instruction that starts one
         while len(bb_starts) > 0:
@@ -138,7 +149,7 @@ class RegisterAllocator:
                 insn_idx += 1
 
             bb = BasicBlock(
-                insns=insns, targets=targets,
+                insns=insns, targets=targets, label=bb_labels.get(bb_start),
                 # we calculate these later
                 r_use=set(), r_def=set(), sources=set(),
             )
@@ -175,6 +186,7 @@ class RegisterAllocator:
                 targets=frozenset(bb.targets),
                 r_use=frozenset(bb.r_use),
                 r_def=frozenset(bb.r_def),
+                label=bb.label,
             )
 
         return bbs
@@ -546,7 +558,10 @@ class RegisterAllocator:
         for bb_ident, bb in bbs.items():
             # create a node for each basic block with its code inside
             code = "\n".join(str(insn) for insn in bb.insns)
-            dot.node(str(bb_ident), code, shape="box", xlabel=str(bb_ident),
+            xlabel = str(bb_ident)
+            if bb.label is not None:
+                xlabel += (": "+bb.label)
+            dot.node(str(bb_ident), code, shape="box", xlabel=xlabel,
                 forcelabels="true")
         for bb_ident, bb in bbs.items():
             # then connect all the nodes
@@ -562,7 +577,10 @@ class RegisterAllocator:
             # create a node for each basic block with its input and output regs
             # inside
             regs = "R_USE: {}\nR_DEF: {}".format(bb.r_use, bb.r_def)
-            dot.node(str(bb_ident), regs, shape="box", xlabel=str(bb_ident),
+            xlabel = str(bb_ident)
+            if bb.label is not None:
+                xlabel += (": "+bb.label)
+            dot.node(str(bb_ident), regs, shape="box", xlabel=xlabel,
                 forcelabels="true")
         for bb_ident, bb in bbs.items():
             # then connect all the nodes
@@ -578,7 +596,10 @@ class RegisterAllocator:
             # create a node for each basic block with its regs inside
             regs = "R_IN: {}\nR_USE: {}\nR_DEF: {}\nR_OUT: {}".format(
                 bb_in[bb_ident], bb.r_use, bb.r_def, bb_out[bb_ident])
-            dot.node(str(bb_ident), regs, shape="box", xlabel=str(bb_ident),
+            xlabel = str(bb_ident)
+            if bb.label is not None:
+                xlabel += (": "+bb.label)
+            dot.node(str(bb_ident), regs, shape="box", xlabel=xlabel,
                 forcelabels="true")
         for bb_ident, bb in bbs.items():
             # then connect all the nodes
@@ -635,7 +656,6 @@ _i_fields = [
     "instr_type",   # type object of the instr that made this insn
     "instr_fields", # dict mapping insn field names to register numbers (rN)
                     #     or values (imm)
-    "code_idx",     # index of the original code array that this insn came from
 ]
 class Insn(namedtuple("Insn", _i_fields)):
     # instructions that branch to a label (not including aliases)
@@ -644,7 +664,7 @@ class Insn(namedtuple("Insn", _i_fields)):
     # instructions where rsd is a source
     INSTRS_RSD_SOURCE = {ST, STR, STX, STXA}
 
-    def __new__(cls, instr, code_idx):
+    def __new__(cls, instr):
         # hack for R_USE cause it's not a boneless instr
         if isinstance(instr, R_USE):
             return super(Insn, cls).__new__(cls,
@@ -653,7 +673,6 @@ class Insn(namedtuple("Insn", _i_fields)):
                 targets=frozenset((None,)),
                 instr_type=R_USE,
                 instr_fields={"rsd": instr.rsd},
-                code_idx=code_idx,
             )
 
         # first, take apart the instr into its component parts
@@ -749,7 +768,6 @@ class Insn(namedtuple("Insn", _i_fields)):
             targets=frozenset(targets),
             instr_type=instr_type,
             instr_fields=instr_fields,
-            code_idx=code_idx,
         )
             
     def __repr__(self):
@@ -792,9 +810,10 @@ class Insn(namedtuple("Insn", _i_fields)):
 del _i_fields # avoid cluttering namespace
 
 BasicBlock = namedtuple("BasicBlock", [
-    "insns", # tuple of instructions in this basic block
-    "r_use", # frozenset of registers used by this basic block
-    "r_def", # frozenset of registers defined by this basic block
+    "insns",   # tuple of instructions in this basic block
+    "r_use",   # frozenset of registers used by this basic block
+    "r_def",   # frozenset of registers defined by this basic block
     "sources", # frozenset of basic blocks that may jump to us
     "targets", # frozenset of basic blocks that we may jump to
+    "label",   # this BB's label in the original program, or None
 ])
