@@ -62,8 +62,12 @@ class RegisterAllocator:
         bbs = RegisterAllocator._make_basic_blocks(self.code)
         bbs = RegisterAllocator._renumber_regs(bbs)
         interferences = RegisterAllocator._calculate_interferences(bbs)
+        colors, uncolorable = \
+            RegisterAllocator._color_interferences(interferences)
+        if len(uncolorable) > 0:
+            raise Exception("failed to color", uncolorable)
         RegisterAllocator._bb_render_code(bbs)
-        RegisterAllocator._bb_render_interferences(interferences)
+        RegisterAllocator._bb_render_interferences(interferences, colors)
         return bbs
 
     # turn some code into a graph of basic blocks
@@ -467,6 +471,65 @@ class RegisterAllocator:
 
         return interferences
 
+    # color the interferences with physical registers so that no physical
+    # register interferes with itself
+    @classmethod
+    def _color_interferences(cls, interferences):
+        # this isn't real graph data structures, so this is gonna get ugly
+
+        # duplicate the input dict so we can slice and dice it. it doesn't need
+        # to be a deep copy since it's only got frozensets inside.
+        interferences = interferences.copy()
+
+        phys_regs = 8
+
+        nodes = []
+        # first, we "simplify" the interference graph by pulling out registers
+        # that could be colored first, then ones that definitely can't be.
+        while len(interferences) > 0:
+            for r, interferers in interferences.items():
+                # we have to figure out how many registers this one currently
+                # interferes with. some may have been removed, so we only count
+                # the ones that are still here.
+                num_interferers = 0
+                for r_o in interferers:
+                    if r_o in interferences:
+                        num_interferers += 1
+                # if this one interferes with less registers than there are
+                # physical registers, it could be colored and we want to
+                # schedule that
+                if num_interferers < phys_regs:
+                    nodes.append((r, interferers))
+                    break
+            else:
+                # we didn't find a register that's not impossible to color. ah
+                # well, let's hope the last one we looked at will be colorable
+                # in the future.
+                nodes.append((r, interferers))
+            # the r left over is the one we just scheduled for coloring. it
+            # doesn't need to be scheduled again.
+            del interferences[r]
+
+        # now we "select" nodes to color, starting with the ones we claimed
+        # couldn't be and hoping that they can get a color anyway.
+        colors = {} # dict from reg to its color
+        uncolorable = []
+        all_colors = set(range(phys_regs))
+        for r, interferers in nodes[::-1]:
+            # figure out the colors of registers that interfere with this one
+            # (we let None mean no color)
+            other_colors = set(colors.get(r_o, None) for r_o in interferers)
+            other_colors.discard(None)
+            possible_colors = all_colors - other_colors
+            if len(possible_colors) == 0:
+                # this register interferes with too many others
+                uncolorable.append((r, interferers))
+            else:
+                # assign the register an arbitrary color
+                colors[r] = possible_colors.pop()
+
+        return colors, uncolorable
+
     @classmethod
     def _bb_render_code(cls, bbs):
         from graphviz import Digraph
@@ -515,12 +578,13 @@ class RegisterAllocator:
         dot.render("/tmp/blah3", view=True)
 
     @classmethod
-    def _bb_render_interferences(cls, interferences):
+    def _bb_render_interferences(cls, interferences, colors=None):
         from graphviz import Graph
         dot = Graph()
         # create a node for each register with its name inside
         for r, interferers in interferences.items():
-            dot.node(str(r), str(r), xlabel=str(len(interferers)),
+            dot.node(str(r), str(r),
+                xlabel=str(len(interferers) if colors is None else colors[r]),
                 forcelabels="true")
         # then connect all the nodes
         for r, interferers in interferences.items():
